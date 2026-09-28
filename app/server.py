@@ -27,6 +27,14 @@ POST /api/loading-sequence
                      （至多 12 层）按整层一次加入；对各已装子集求抗倾覆带符号裕量，
                      用动态规划求全过程最小裕量最大的装货顺序（同分按层序号字典序）；
                      只计算，不写盘；前置条件不足或候选层超过 12 时返回 planable=false
+POST /api/door-passage
+                     连续窑门通行试算：body {"state"(可省), "doors":
+                     [{center,width,height,maxShift}, ...]}（按行进顺序，单位 mm），
+                     由窑车台面与各层棚板求横向外廓、累加层高求最高点，逐门计算
+                     可通过的横移闭区间（高度不足直接阻断），按门序用上一可达区间
+                     扩张本段横移量后与本门区间求交，首次交集为空即阻断并给出冲突；
+                     全程可达时回溯一条位置序列与逐门左/右/顶部净空；
+                     只计算，不写盘；架体没有层时返回 evaluable=false，门参数非法返回 400
 POST /api/reset      恢复内置示例数据
 """
 
@@ -40,6 +48,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from .calc import (
     calculate,
+    door_passage,
     load_shed,
     loading_sequence,
     overturn_check,
@@ -210,6 +219,26 @@ def api_loading_sequence():
     # 加速度分量非法（非数字）→ 400；前置条件不足（无承托/凸包退化/超 12 层等）属于正常结果 → 200 + planable=false
     try:
         result = loading_sequence(state, payload.get("ax", 0), payload.get("ay", 0))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/door-passage", methods=["POST"])
+def api_door_passage():
+    """连续窑门通行试算：横向外廓 + 门序可达闭区间递推 + 回溯位置序列。
+
+    只读取当前编辑架体与随请求提交的窑门参数，不写盘、不改已保存状态。
+    窑门参数非法（非数组、非数值、宽度/高度非正、横移量为负）→ 400；
+    架体条件不足（没有层）属于正常结果 → 200 + evaluable=false。
+    """
+    payload = request.get_json(force=True, silent=True)
+    payload = payload if isinstance(payload, dict) else {}
+    state = payload.get("state")
+    if not isinstance(state, dict):
+        state = load_state()
+    try:
+        result = door_passage(state, payload.get("doors", []))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"ok": True, **result})

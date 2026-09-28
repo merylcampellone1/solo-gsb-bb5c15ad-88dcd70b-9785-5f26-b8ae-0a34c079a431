@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.calc import (  # noqa: E402
     calculate,
+    door_passage,
     load_shed,
     loading_sequence,
     normalize,
@@ -1219,6 +1220,245 @@ class CalcTests(unittest.TestCase):
         oc0 = overturn_check(cleared, 0.15, -0.1)
         self.assertEqual(r["steps"][0]["margin"], oc0["margin"])
         self.assertEqual(r["steps"][0]["totalWeight"], oc0["totalWeight"])
+
+
+class DoorPassageTests(unittest.TestCase):
+    """连续窑门通行试算：横向外廓 + 门序可达闭区间递推 + 回溯位置序列。"""
+
+    def _rack(self, boards=None, car_w=1000, heights=None):
+        """构造台面宽 car_w、各层棚板 (x,w)（d 给 100）的简化架体。"""
+        boards = boards if boards is not None else [(0, 1000), (100, 800)]
+        heights = heights if heights is not None else [300] * len(boards)
+        return {
+            "car": {"w": car_w, "d": 100},
+            "layers": [
+                {
+                    "name": f"L{i}",
+                    "height": heights[i],
+                    "board": {"x": x, "y": 0, "w": w, "d": 100, "weight": 10},
+                    "wareWeight": 0,
+                    "posts": [],
+                }
+                for i, (x, w) in enumerate(boards)
+            ],
+        }
+
+    def test_profile_uses_car_and_boards_sum_heights(self):
+        state = self._rack(boards=[(0, 1000), (100, 800)], heights=[320, 300])
+        r = door_passage(state, [])
+        self.assertTrue(r["evaluable"])
+        self.assertEqual(r["profile"]["totalHeight"], 620.0)
+        self.assertEqual(r["profile"]["envelope"],
+                         {"left": 0.0, "right": 1000.0, "width": 1000.0})
+        kinds = [(s["kind"], s["z"], s["left"], s["right"])
+                 for s in r["profile"]["slabs"]]
+        self.assertEqual(kinds, [
+            ("car", 0.0, 0.0, 1000.0),
+            ("board", 320.0, 0.0, 1000.0),
+            ("board", 620.0, 100.0, 900.0),
+        ])
+
+    def test_single_centered_door_passable_with_clearances(self):
+        # 外廓 [0,1000]；门中心 500、宽 1100 → 开口 [-50,1050] → 区间 [-50,50]
+        # 首段 m=100，首门前 {0}，可达 [-50,50]；回溯取最接近 0 → 0
+        r = door_passage(
+            self._rack(),
+            [{"center": 500, "width": 1100, "height": 700, "maxShift": 100}],
+        )
+        self.assertTrue(r["passable"])
+        d = r["doors"][0]
+        self.assertEqual(d["interval"], {"lo": -50.0, "hi": 50.0})
+        self.assertEqual(d["reachable"], {"lo": -50.0, "hi": 50.0})
+        self.assertEqual(d["chosenShift"], 0.0)
+        self.assertEqual(d["move"], 0.0)
+        self.assertEqual(d["clearance"], {"left": 50.0, "right": 50.0, "top": 100.0})
+        self.assertEqual(r["positions"][0]["shift"], 0.0)
+
+    def test_height_shortage_blocks_directly(self):
+        r = door_passage(
+            self._rack(heights=[300, 300]),  # 总高 600
+            [{"center": 500, "width": 2000, "height": 599, "maxShift": 100}],
+        )
+        self.assertFalse(r["passable"])
+        self.assertEqual(r["blockedAt"], 0)
+        self.assertEqual(r["blockReason"], "height")
+        d = r["doors"][0]
+        self.assertFalse(d["heightOk"])
+        self.assertIsNone(d["interval"])
+        self.assertEqual(d["conflict"]["shortage"], 1.0)
+
+    def test_exact_height_and_touching_edge_count_as_passable(self):
+        # 净高恰等于最高点、区间恰好接触（闭区间）即可通过
+        r = door_passage(
+            self._rack(),
+            [{"center": 500, "width": 1000, "height": 600, "maxShift": 0}],
+        )
+        self.assertTrue(r["passable"])
+        d = r["doors"][0]
+        self.assertEqual(d["interval"], {"lo": 0.0, "hi": 0.0})
+        self.assertEqual(d["reachable"], {"lo": 0.0, "hi": 0.0})
+        self.assertEqual(d["clearance"]["top"], 0.0)
+        self.assertEqual(d["clearance"]["left"], 0.0)
+        self.assertEqual(d["clearance"]["right"], 0.0)
+
+    def test_width_insufficient_blocks_even_alone(self):
+        # 外廓宽 1000，门宽 900 → 区间下界比上界大 100，单门宽度不足
+        r = door_passage(
+            self._rack(),
+            [{"center": 500, "width": 900, "height": 700, "maxShift": 100}],
+        )
+        self.assertFalse(r["passable"])
+        self.assertEqual(r["blockedAt"], 0)
+        self.assertEqual(r["blockReason"], "width")
+        self.assertTrue(r["doors"][0]["intervalEmpty"])
+        self.assertEqual(r["doors"][0]["conflict"]["shortage"], 100.0)
+
+    def test_each_door_fine_but_sequence_unreachable(self):
+        # 门1：中心 500、宽 1100，区间 [-50,50]，首段 m=0 → 只能停在 0。
+        # 门2：中心 700、宽 1100（开口 150..1250），区间 [150,250]；
+        # 本段 m=100 把 {0} 扩张为 [-100,100]，与 [150,250] 无交集 → 阻断。
+        # 两门单独评估都有非空区间，但连续序列不存在。
+        r = door_passage(
+            self._rack(),
+            [
+                {"center": 500, "width": 1100, "height": 700, "maxShift": 0},
+                {"center": 700, "width": 1100, "height": 700, "maxShift": 100},
+            ],
+        )
+        self.assertTrue(r["doors"][0]["passable"])
+        self.assertEqual(r["doors"][0]["reachable"], {"lo": 0.0, "hi": 0.0})
+        self.assertFalse(r["passable"])
+        self.assertEqual(r["blockedAt"], 1)
+        self.assertEqual(r["blockReason"], "reach")
+        c = r["doors"][1]["conflict"]
+        self.assertEqual(c["doorInterval"], {"lo": 150.0, "hi": 250.0})
+        self.assertEqual(c["reachExpanded"], {"lo": -100.0, "hi": 100.0})
+        self.assertEqual(c["shortage"], 50.0)
+        self.assertEqual(c["side"], "right")
+
+    def test_backtrack_position_sequence_respects_segment_limits(self):
+        # 门1 区间 [-50,50]、m=100 → 可达 [-50,50]
+        # 门2 区间 [-130,-30]、m=100 → 扩张 [-150,150]，可达 [-130,-30]
+        # 回溯：门2 取最接近 0 = -30；门1 取可达区间内最接近 -30 = -30；
+        # 首门由 0 移动 -30（≤100），门2 移动 0。
+        r = door_passage(
+            self._rack(),
+            [
+                {"center": 500, "width": 1100, "height": 700, "maxShift": 100},
+                {"center": 420, "width": 1100, "height": 700, "maxShift": 100},
+            ],
+        )
+        self.assertTrue(r["passable"])
+        self.assertEqual([p["shift"] for p in r["positions"]], [-30.0, -30.0])
+        self.assertEqual([p["move"] for p in r["positions"]], [-30.0, 0.0])
+        # 门2 净空：开口 [-130,970]；外廓移到 [-30,970] → 左 100、右 0
+        self.assertEqual(r["positions"][1]["clearance"]["left"], 100.0)
+        self.assertEqual(r["positions"][1]["clearance"]["right"], 0.0)
+
+    def test_backtrack_forces_move_when_next_door_farther(self):
+        # 门1 可达 [-50,50]（m=100）；门2 开口 [-100,940]（宽 1040）：
+        # 区间 [-100,-60]，m=30 扩张为 [-80,80]，交集 [-80,-60]。
+        # 门2 取最接近 0 = -60；门1 clamp(-60,-50,50)=-50；移动 -50 ≤ 100，
+        # 门2 再移动 -10（|−10|≤30）。
+        r = door_passage(
+            self._rack(),
+            [
+                {"center": 500, "width": 1100, "height": 700, "maxShift": 100},
+                {"center": 420, "width": 1040, "height": 700, "maxShift": 30},
+            ],
+        )
+        self.assertTrue(r["passable"])
+        self.assertEqual([p["shift"] for p in r["positions"]], [-50.0, -60.0])
+        self.assertEqual([p["move"] for p in r["positions"]], [-50.0, -10.0])
+
+    def test_multi_level_envelope_intersection_narrows_interval(self):
+        # 台面/底板 [0,1000]，顶板 [200,700]；门开口 [100,900]：
+        # 台面要求 s∈[100,-100] 已为空 → 阻断，换一扇足够宽但偏置的门：
+        # 开口 [50,1050] → 台面 [50,50]，顶板 [50-200=-150, 1050-700=350]
+        # 交集 [50,50]，说明受台面（更宽的外廓件）约束。
+        r = door_passage(
+            self._rack(boards=[(0, 1000), (200, 500)]),
+            [{"center": 550, "width": 1000, "height": 700, "maxShift": 100}],
+        )
+        self.assertTrue(r["passable"])
+        self.assertEqual(r["doors"][0]["reachable"], {"lo": 50.0, "hi": 50.0})
+        self.assertEqual(r["doors"][0]["chosenShift"], 50.0)
+
+    def test_first_door_reach_bounded_by_segment_shift(self):
+        # 本门区间 [150,150]，但首段最大横移仅 30 → 扩张 [-30,30]，无交集
+        r = door_passage(
+            self._rack(),
+            [{"center": 650, "width": 1000, "height": 700, "maxShift": 30}],
+        )
+        self.assertFalse(r["passable"])
+        self.assertEqual(r["blockReason"], "reach")
+        self.assertEqual(r["doors"][0]["conflict"]["shortage"], 120.0)
+
+    def test_empty_doors_is_passable_with_note(self):
+        r = door_passage(self._rack(), [])
+        self.assertTrue(r["evaluable"])
+        self.assertTrue(r["passable"])
+        self.assertEqual(r["doorCount"], 0)
+        self.assertIsNotNone(r["note"])
+        self.assertIsNone(r["positions"])
+
+    def test_empty_rack_not_evaluable(self):
+        r = door_passage({"car": {"w": 1000}, "layers": []}, [])
+        self.assertFalse(r["evaluable"])
+        self.assertIn("没有任何层", r["reason"])
+
+    def test_later_doors_marked_unevaluated_after_block(self):
+        r = door_passage(
+            self._rack(heights=[300, 300]),
+            [
+                {"center": 500, "width": 900, "height": 700, "maxShift": 0},   # 宽度阻断
+                {"center": 500, "width": 2000, "height": 700, "maxShift": 0},
+            ],
+        )
+        self.assertEqual(r["blockedAt"], 0)
+        self.assertFalse(r["doors"][0]["passable"])
+        self.assertFalse(r["doors"][1]["evaluated"])
+
+    def test_invalid_params_raise(self):
+        state = self._rack()
+        with self.assertRaises(ValueError):
+            door_passage(state, "x")
+        with self.assertRaises(ValueError):
+            door_passage(state, [{"center": "a", "width": 1, "height": 1, "maxShift": 0}])
+        with self.assertRaises(ValueError):
+            door_passage(state, [{"center": 0, "width": 0, "height": 1, "maxShift": 0}])
+        with self.assertRaises(ValueError):
+            door_passage(state, [{"center": 0, "width": 1, "height": 0, "maxShift": 0}])
+        with self.assertRaises(ValueError):
+            door_passage(state, [{"center": 0, "width": 1, "height": 1, "maxShift": -1}])
+        with self.assertRaises(ValueError):
+            door_passage(state, [{"center": 0, "width": 1, "height": float("inf"), "maxShift": 0}])
+
+    def test_does_not_mutate_input(self):
+        with open(SAMPLE, encoding="utf-8") as f:
+            state = json.load(f)
+        doors = [
+            {"center": 650, "width": 1400, "height": 970, "maxShift": 100},
+            {"center": 570, "width": 1400, "height": 960, "maxShift": 100},
+        ]
+        before = json.loads(json.dumps({"state": state, "doors": doors}, ensure_ascii=False))
+        r = door_passage(state, doors)
+        self.assertTrue(r["passable"])
+        self.assertEqual({"state": state, "doors": doors}, before)
+
+    def test_sample_state_passable(self):
+        with open(SAMPLE, encoding="utf-8") as f:
+            state = json.load(f)
+        r = door_passage(
+            state,
+            [
+                {"center": 650, "width": 1400, "height": 970, "maxShift": 100},
+                {"center": 570, "width": 1400, "height": 960, "maxShift": 100},
+            ],
+        )
+        self.assertTrue(r["passable"])
+        self.assertEqual(r["profile"]["totalHeight"], 960.0)
+        self.assertEqual([p["shift"] for p in r["positions"]], [-30.0, -30.0])
 
 
 if __name__ == "__main__":

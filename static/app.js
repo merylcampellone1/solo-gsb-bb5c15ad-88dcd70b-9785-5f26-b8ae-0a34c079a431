@@ -56,6 +56,21 @@ let seqReqSeq = 0;             // 请求序号，丢弃过期响应
 let seqErr = null;             // 最近一次参数错误提示（400）
 let seqTimer = null;           // 加速度输入变化后的防抖重算
 
+/* ================= 连续窑门通行试算状态 =================
+ * doorInputs 只存在于浏览器（窑门参数不写入架体状态、不持久化）；
+ * doorData 只来自 POST /api/door-passage（或离线兜底），只读不写盘。
+ * 架体或门参数改变后旧结果立即作废（stale），需重新试算。
+ */
+let doorInputs = [
+  { center: 650, width: 1400, height: 970, maxShift: 100 },
+  { center: 570, width: 1400, height: 960, maxShift: 100 },
+];
+let doorData = null;           // 最近一次通行试算结果
+let doorReqSeq = 0;            // 请求序号，丢弃过期响应
+let doorErr = null;            // 最近一次参数错误提示（400）
+let doorStale = false;         // 试算后架体/门参数已变化：旧结果失效
+let doorTimer = null;          // 门参数变化后的防抖重算
+
 /* ================= 数值/工具 ================= */
 const $ = (sel) => document.querySelector(sel);
 const fmt = (v) => (Math.round(v * 100) / 100).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
@@ -123,6 +138,8 @@ async function recalcAndRender(applyChange) {
   invalidateOverturn({ silent: true });
   // 逐层装货顺序规划同样只依赖架体几何/重量：任何编辑都使旧规划作废
   invalidateSequence({ silent: true });
+  // 连续窑门通行试算只依赖架体几何：任何编辑都使旧试算失效
+  invalidateDoorTrial({ silent: true });
   suggestAppliedMsg = null;
   if (applyChange !== "shed") shedAppliedMsg = null;
   try {
@@ -381,6 +398,7 @@ $("#btnReset").addEventListener("click", async () => {
   invalidateShed({ silent: true });
   invalidateOverturn({ silent: true });
   invalidateSequence({ silent: true });
+  invalidateDoorTrial({ silent: true });
   suggestAppliedMsg = null;
   shedAppliedMsg = null;
   renderEditor(); renderResults(); markLayerBadges();
@@ -408,6 +426,7 @@ function renderResults() {
   renderShedPanel();
   renderOverturnPanel();
   renderSeqPanel();
+  renderDoorPanel();
 }
 
 function renderTotals() {
@@ -1901,6 +1920,341 @@ $("#btnCancelSeq").addEventListener("click", cancelSequence);
   });
 });
 
+/* ================= 连续窑门通行试算面板 ================= */
+/* 架体发生编辑/重置：旧试算立即失效（试算只读，不存在确认写入） */
+function invalidateDoorTrial(opts) {
+  doorData = null;
+  doorErr = null;
+  doorStale = false;
+  doorReqSeq++;
+  clearTimeout(doorTimer);
+  // 行着色不依赖面板渲染，静默作废（架体编辑）时也立即清掉，避免旧红绿框残留
+  markDoorRows();
+  if (!opts || !opts.silent) {
+    renderDoorPanel();
+  }
+}
+
+function collectDoorInputs() {
+  doorInputs = [...document.querySelectorAll("#doorList .door-row")].map((row) => ({
+    center: num(row.querySelector('[data-df="center"]').value),
+    width: num(row.querySelector('[data-df="width"]').value),
+    height: num(row.querySelector('[data-df="height"]').value),
+    maxShift: num(row.querySelector('[data-df="maxShift"]').value),
+  }));
+  return doorInputs;
+}
+
+function renderDoorEditor() {
+  const list = $("#doorList");
+  if (!list) return;
+  if (!doorInputs.length) doorInputs = [];
+  list.innerHTML = `<div class="door-rows">${doorInputs.map((d, i) => doorRowHtml(d, i)).join("")}</div>`;
+  markDoorRows();
+}
+
+function doorRowHtml(d, i) {
+  return `
+  <div class="door-row" data-di="${i}">
+    <span class="door-no">第${i + 1}道</span>
+    <label>开口中心 c (mm)<input type="number" step="any" data-df="center" value="${d.center}"></label>
+    <label>宽度 w (mm)<input type="number" step="any" data-df="width" value="${d.width}"></label>
+    <label>高度 h (mm)<input type="number" step="any" data-df="height" value="${d.height}"></label>
+    <label>本段最大横移 (mm)<input type="number" step="any" data-df="maxShift" value="${d.maxShift}" min="0"></label>
+    <div class="door-order">
+      <button type="button" data-dact="up" title="前移（先通过）">▲</button>
+      <button type="button" data-dact="down" title="后移（后通过）">▼</button>
+      <button type="button" data-dact="del" title="删除该门">✕</button>
+    </div>
+  </div>`;
+}
+
+/* 试算结果只给行着色，不重建输入框（避免输入中失焦） */
+function markDoorRows() {
+  document.querySelectorAll("#doorList .door-row").forEach((row) => {
+    const i = +row.dataset.di;
+    const d = doorData && (doorData.doors || [])[i];
+    row.classList.toggle("is-blocked", !!(d && d.evaluated && !d.passable));
+    row.classList.toggle("is-passable", !!(d && d.passable));
+  });
+}
+
+async function runDoorTrial() {
+  if (!state) return;
+  const doors = collectDoorInputs();
+  // 前端先做一遍基本校验（与后端一致），参数非法时直接提示，不发请求
+  try {
+    validateDoors(doors);
+  } catch (e) {
+    doorData = null;
+    doorErr = e.message;
+    doorStale = false;
+    markDoorRows();
+    renderDoorPanel();
+    return;
+  }
+  const status = $("#doorStatus");
+  doorErr = null;
+  doorStale = false;
+  status.textContent = "试算中…";
+  status.className = "badge has-door";
+  const seq = ++doorReqSeq;
+  let data;
+  try {
+    const res = await fetch("/api/door-passage", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state, doors }),
+    });
+    data = await res.json().catch(() => null);
+    if (!res.ok) {
+      if (seq !== doorReqSeq) return;
+      doorData = null;
+      doorErr = (data && data.error) || `试算失败（HTTP ${res.status}）`;
+      markDoorRows();
+      renderDoorPanel();
+      return;
+    }
+  } catch (e) {
+    data = doorPassageLocal(state, doors); // 离线兜底：与后端同一套算法
+  }
+  if (seq !== doorReqSeq) return; // 期间已有编辑/重置，丢弃过期响应
+  doorData = data;
+  markDoorRows();
+  renderDoorPanel();
+}
+
+function validateDoors(doors) {
+  doors.forEach((d, i) => {
+    const label = `第 ${i + 1} 道门`;
+    [["center", "开口横向中心"], ["width", "开口宽度"], ["height", "开口高度"], ["maxShift", "本段最大横移量"]]
+      .forEach(([k, name]) => {
+        if (!Number.isFinite(d[k])) throw new Error(`${label}${name}必须是数值（mm）`);
+      });
+    if (d.width <= 0) throw new Error(`${label}开口宽度必须大于 0`);
+    if (d.height <= 0) throw new Error(`${label}开口高度必须大于 0`);
+    if (d.maxShift < 0) throw new Error(`${label}本段最大横移量不能为负`);
+  });
+}
+
+function cancelDoorTrial() {
+  doorData = null;
+  doorErr = null;
+  doorStale = false;
+  doorReqSeq++;
+  clearTimeout(doorTimer);
+  markDoorRows();
+  renderDoorPanel();
+}
+
+function ivText(iv) {
+  if (!iv) return "—";
+  const l = iv.lo == null ? "-∞" : fmt(iv.lo);
+  const h = iv.hi == null ? "+∞" : fmt(iv.hi);
+  return `[${l}, ${h}]`;
+}
+
+const DOOR_BLOCK_TEXT = {
+  height: "高度不足（直接阻断）",
+  width: "单门宽度不足",
+  reach: "横移序列不可达",
+};
+
+function renderDoorPanel() {
+  const out = $("#doorOutput");
+  const status = $("#doorStatus");
+  const btnCancel = $("#btnCancelDoor");
+  if (!out) return;
+  btnCancel.disabled = !doorData && !doorErr && !doorStale;
+
+  if (doorErr) {
+    status.textContent = "参数有误";
+    status.className = "badge";
+    out.innerHTML = `<p class="ov-reason">⚠ ${escapeHtml(doorErr)}</p>`;
+    return;
+  }
+  if (!doorData) {
+    status.textContent = doorStale ? "结果已失效" : "未试算";
+    status.className = "badge" + (doorStale ? " stale" : "");
+    out.innerHTML = doorStale
+      ? `<p class="ov-reason">⚠ 架体或门参数已改变，旧试算结果已失效，请重新点击「开始通行试算」。</p>`
+      : `<p class="muted" style="margin:8px 0 0">按行进顺序录入窑门参数（开口中心 / 宽 / 高 / 本段最大横移，单位 mm）后点击「开始通行试算」。
+         首门从横移 0 出发；试算只读取当前架体、不写盘，架体或门参数改变后旧结果立即失效。</p>`;
+    return;
+  }
+
+  const d = doorData;
+  if (doorStale) {
+    status.textContent = "结果已失效";
+    status.className = "badge stale";
+  } else if (!d.evaluable) {
+    status.textContent = "无法评估";
+    status.className = "badge";
+  } else if (d.passable) {
+    status.textContent = d.doorCount ? "全程可通行" : "无门可过";
+    status.className = "badge has-door";
+  } else {
+    status.textContent = `第${d.blockedAt + 1}道门阻断`;
+    status.className = "badge has-door blocked";
+  }
+
+  const p = d.profile;
+  const env = p.envelope;
+  const slabHtml = (p.slabs || []).map((s) =>
+    `<span class="s">${s.kind === "car" ? "台面" : "棚板"} ${escapeHtml(s.name)}
+      <b>z=${fmt(s.z)}</b> <b>[${fmt(s.left)}, ${fmt(s.right)}]</b></span>`).join(" ｜ ");
+
+  let body = `
+    <div class="door-profile">
+      <span>架体最高点（累加层高）<b>${fmt(p.totalHeight)}</b> mm</span>
+      <span>横向外廓 <b>[${fmt(env.left)}, ${fmt(env.right)}]</b>（宽 <b>${fmt(env.width)}</b> mm）</span>
+      <span>窑门 <b>${d.doorCount}</b> 道</span>
+    </div>
+    <p class="door-slabs muted" style="margin:2px 0 0">${slabHtml || '<span class="muted">（无外廓件）</span>'}</p>`;
+
+  if (!d.evaluable) {
+    out.innerHTML = body + `<p class="ov-reason">🚫 <b>无法评估：</b>${escapeHtml(d.reason || "架体条件不足")}</p>`;
+    return;
+  }
+  if (d.note) {
+    body += `<p class="hint" style="margin:6px 0 0">${escapeHtml(d.note)}</p>`;
+  }
+
+  if (!d.passable) {
+    const bd = d.doors[d.blockedAt];
+    let detail = "";
+    if (bd.blockReason === "height") {
+      const c = bd.conflict;
+      detail = `门高 <b>${fmt(c.doorHeight)}</b> mm &lt; 架体最高点 <b>${fmt(c.totalHeight)}</b> mm，
+        顶部尚差 <b class="bad">${fmt(c.shortage)}</b> mm；高度不足直接判为阻断，不再计算横移区间。`;
+    } else if (bd.blockReason === "width") {
+      const c = bd.conflict;
+      detail = `本门可通过的横移区间为 ${ivText(c.interval)}（下界 &gt; 上界，区间为空）：
+        门宽 <b>${fmt(c.doorWidth)}</b> mm 小于架体横向外廓宽 <b>${fmt(c.envelopeWidth)}</b> mm，
+        至少还差 <b class="bad">${fmt(c.shortage)}</b> mm；该门即使单独评估也无法通过。`;
+    } else if (bd.blockReason === "reach") {
+      const c = bd.conflict;
+      detail = `进入本门之前，把上一道门后的可达区间按本段最大横移量扩张得 ${ivText(c.reachExpanded)}，
+        与本门可通过区间 ${ivText(c.doorInterval)} <b>没有交集</b>
+        （缺口 <b class="bad">${fmt(c.shortage)}</b> mm，本门要求向${c.side === "left" ? "左" : "右"}调整）；
+        虽然各门单独都能给出横移区间，但<b>连续通过的位置序列不存在</b>。`;
+    }
+    body += `
+      <p class="ov-reason">🚫 <b>第 ${d.blockedAt + 1} 道门阻断（${DOOR_BLOCK_TEXT[bd.blockReason]}）：</b><br>${detail}</p>`;
+  } else if (d.doorCount > 0) {
+    const chips = (d.positions || []).map((q, i) =>
+      `<span class="pos-chip">第${i + 1}道 · 横移 <b>${fmt(q.shift)}</b> mm
+        <small>（本段移动 ${fmt(q.move)} / ≤ ${fmt(q.maxShift)}）</small></span>`).join("");
+    body += `
+      <p class="sug-applied" style="margin:8px 0 0">✓ ${d.doorCount} 道门全程可达。下面是回溯得到的一条满足各段横移限制的位置序列（首门从 0 出发）：</p>
+      <div class="door-pos">${chips}</div>`;
+  }
+
+  if (d.doors.length) {
+    const rows = d.doors.map((dr) => {
+      const verdict = !dr.evaluated
+        ? '<td colspan="3" class="muted">未评估（前序门已阻断）</td>'
+        : dr.blockReason === "height"
+        ? '<td colspan="3" class="bad">高度不足，阻断</td>'
+        : dr.blockReason
+        ? `<td class="bad">${ivText(dr.interval)}</td>
+           <td>${ivText(dr.reachExpanded)}</td>
+           <td class="bad">空（${DOOR_BLOCK_TEXT[dr.blockReason]}）</td>`
+        : `<td>${ivText(dr.interval)}</td>
+           <td>${ivText(dr.reachExpanded)}</td>
+           <td class="good"><b>${ivText(dr.reachable)}</b></td>`;
+      const clr = dr.clearance
+        ? `<td class="${dr.clearance.top <= 0 ? "warn" : "good"}">${fmt(dr.clearance.top)}</td>
+           <td class="${dr.clearance.left <= 0 ? "warn" : "good"}">${fmt(dr.clearance.left)}</td>
+           <td class="${dr.clearance.right <= 0 ? "warn" : "good"}">${fmt(dr.clearance.right)}</td>`
+        : '<td colspan="3" class="muted">—</td>';
+      const judge = !dr.evaluated
+        ? '<span class="muted">—</span>'
+        : dr.passable
+          ? '<span style="color:var(--normal)">✓ 可通过</span>'
+          : `<span class="bad">✕ ${DOOR_BLOCK_TEXT[dr.blockReason] || "阻断"}</span>`;
+      return `<tr class="${dr.evaluated && !dr.passable ? "blocked" : ""}">
+        <td>${dr.index + 1}</td>
+        <td>${fmt(dr.center)}<br><small>${fmt(dr.width)} × ${fmt(dr.height)}</small></td>
+        <td><small>[${fmt(dr.opening.left)}, ${fmt(dr.opening.right)}]</small></td>
+        <td>${fmt(dr.maxShift)}</td>
+        ${verdict}
+        ${clr}
+        <td>${dr.chosenShift == null ? "—" : `<b>${fmt(dr.chosenShift)}</b>`}<br><small>${dr.move == null ? "" : `本段移动 ${fmt(dr.move)}`}</small></td>
+        <td>${judge}</td>
+      </tr>`;
+    }).join("");
+    body += `
+      <div class="door-table-wrap">
+        <table class="src-table sug-table ov-table door-table">
+          <tr class="head">
+            <td>门序</td><td>中心 c<br><small>宽×高</small></td><td>开口左右沿</td><td>本段<br>最大横移</td>
+            <td>本门可通过区间</td><td>扩张后可达</td><td>交集(可达区间)</td>
+            <td>顶部净空</td><td>左净空</td><td>右净空</td>
+            <td>选定横移<br><small>(mm)</small></td><td>判定</td>
+          </tr>
+          ${rows}
+        </table>
+      </div>
+      <p class="hint" style="margin:0">所有长度单位均为 mm；闭区间端点相等（净空 0）视为刚好可通过。左/右/顶部净空为回溯选定横移位置下的值。</p>`;
+  }
+  out.innerHTML = body;
+}
+
+$("#btnDoor").addEventListener("click", runDoorTrial);
+$("#btnCancelDoor").addEventListener("click", cancelDoorTrial);
+$("#btnAddDoor").addEventListener("click", () => {
+  collectDoorInputs();
+  doorInputs.push({ center: 0, width: 1400, height: 1000, maxShift: 100 });
+  renderDoorEditor();
+  markDoorResultStale();
+  scheduleDoorRun();
+});
+/* 门行内：上移 / 下移 / 删除（事件委托，不影响输入框焦点） */
+$("#doorList").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-dact]");
+  if (!btn) return;
+  collectDoorInputs();
+  const row = e.target.closest(".door-row");
+  const i = +row.dataset.di;
+  const act = btn.dataset.dact;
+  if (act === "del") {
+    doorInputs.splice(i, 1);
+  } else if (act === "up" && i > 0) {
+    [doorInputs[i - 1], doorInputs[i]] = [doorInputs[i], doorInputs[i - 1]];
+  } else if (act === "down" && i < doorInputs.length - 1) {
+    [doorInputs[i + 1], doorInputs[i]] = [doorInputs[i], doorInputs[i + 1]];
+  } else {
+    return;
+  }
+  renderDoorEditor();
+  markDoorResultStale();
+  scheduleDoorRun();
+});
+/* 门参数输入：仅采集（不重建 DOM，保持焦点），有旧结果时防抖自动重算并标记失效 */
+$("#doorList").addEventListener("input", () => {
+  collectDoorInputs();
+  markDoorResultStale();
+  scheduleDoorRun();
+});
+
+/* 门参数变化后的防抖重算：只有已经试算过（有结果或参数错误）才自动重跑 */
+function scheduleDoorRun() {
+  clearTimeout(doorTimer);
+  doorTimer = setTimeout(() => {
+    if (doorData || doorErr) runDoorTrial();
+  }, 300);
+}
+
+/* 门参数变化但尚未重算：标记旧结果失效（不立即清空，重算后替换） */
+function markDoorResultStale() {
+  doorErr = null;
+  if (doorData && !doorStale) {
+    doorStale = true;
+    renderDoorPanel();
+  }
+}
+
 /* ================= 画布随窗口缩放重绘 ================= */
 window.addEventListener("resize", debounce(() => { drawTop(); drawSide(); }, 150));
 
@@ -1918,6 +2272,7 @@ async function init() {
     return;
   }
   renderEditor();
+  renderDoorEditor();
   renderResults();
   markLayerBadges();
   setSaveState("saved", "✓ 就绪 " + new Date().toLocaleTimeString("zh-CN"));
@@ -2850,5 +3205,169 @@ function loadingSequenceLocal(rawState, ax, ay) {
     supportPoints, supportPointCount: bottomPoints.length,
     order: orderIdx.slice(), steps, initial: steps[0],
     minMargin: r2(minMarginVal), minMarginStep: minStep.step, allStable,
+  };
+}
+
+/* ======================================================================
+ * 连续窑门通行试算离线兜底：与 app/calc.py 的 door_passage 对齐（只读不存）
+ *
+ * 横向外廓只取台面与各层棚板 X 向跨度（z=累计高度），最高点 = Σ层高；
+ * 每道门：高度不足直接阻断，否则求外廓各件平移后落在开口内的横移闭区间；
+ * 按门序把上一可达区间扩张本段 maxShift 后与本门区间求交，首次空交集即阻断；
+ * 全程可达时回溯「最靠近 0」的位置序列并给逐门左/右/顶部净空。
+ * ==================================================================== */
+function doorPassageLocal(rawState, rawDoors) {
+  validateDoors(rawDoors || []);
+  const doors = (rawDoors || []).map((d, i) => ({
+    index: i,
+    center: parseFloat(d.center), width: parseFloat(d.width),
+    height: parseFloat(d.height), maxShift: parseFloat(d.maxShift),
+  }));
+  // 规范化（与 calculateLocal 同样的宽容规则）
+  const car = {
+    name: (rawState.car && rawState.car.name) || "窑车台面",
+    w: Math.max(0, num(rawState.car && rawState.car.w)),
+    d: Math.max(0, num(rawState.car && rawState.car.d)),
+  };
+  const layers = (rawState.layers || []).map((l0, idx) => {
+    const b0 = l0.board || {};
+    return {
+      id: l0.id || "L" + idx,
+      name: l0.name || "第" + (idx + 1) + "层",
+      height: Math.max(0, num(l0.height)),
+      board: { x: num(b0.x), y: num(b0.y), w: Math.max(0, num(b0.w)), d: Math.max(0, num(b0.d)), weight: Math.max(0, num(b0.weight)) },
+      wareWeight: Math.max(0, num(l0.wareWeight)),
+    };
+  });
+  const n = layers.length;
+  const EPS = 1e-9;
+
+  const slabs = [];
+  if (car.w > 0) slabs.push({ kind: "car", name: car.name, z: 0, left: 0, right: car.w, width: car.w });
+  let cumZ = 0;
+  layers.forEach((L) => {
+    cumZ += L.height;
+    if (L.board.w > 0) {
+      slabs.push({ kind: "board", name: L.name, z: cumZ, left: L.board.x, right: L.board.x + L.board.w, width: L.board.w });
+    }
+  });
+  const envL = slabs.length ? Math.min(...slabs.map((s) => s.left)) : 0;
+  const envR = slabs.length ? Math.max(...slabs.map((s) => s.right)) : 0;
+  const profile = {
+    totalHeight: r2(cumZ),
+    envelope: { left: r2(envL), right: r2(envR), width: r2(envR - envL) },
+    slabs: slabs.map((s) => ({ kind: s.kind, name: s.name, z: r2(s.z), left: r2(s.left), right: r2(s.right), width: r2(s.width) })),
+  };
+  const echo = (d) => ({
+    index: d.index, center: r2(d.center), width: r2(d.width), height: r2(d.height),
+    maxShift: r2(d.maxShift),
+    opening: { left: r2(d.center - d.width / 2), right: r2(d.center + d.width / 2) },
+  });
+  const ivJson = (lo, hi) => ({
+    lo: lo === -Infinity ? null : r2(lo),
+    hi: hi === Infinity ? null : r2(hi),
+  });
+
+  if (n === 0) {
+    return {
+      ok: true, evaluable: false,
+      reason: "当前架体没有任何层，无法确定横向外廓与累计层高，不能进行窑门通行试算",
+      profile, doorCount: doors.length, passable: false,
+      blockedAt: null, blockReason: null, doors: doors.map(echo), positions: null, note: null,
+    };
+  }
+
+  const m = doors.length;
+  const rows = [];
+  const reachIvs = [];
+  let prevLo = 0, prevHi = 0;
+  let blockedAt = null, blockReason = null;
+
+  doors.forEach((d) => {
+    const openL = d.center - d.width / 2, openR = d.center + d.width / 2;
+    const row = {
+      ...echo(d), evaluated: true, heightOk: true, interval: null, intervalEmpty: false,
+      reachExpanded: null, reachable: null, passable: false, blockReason: null,
+      conflict: null, chosenShift: null, move: null, clearance: null,
+    };
+    rows.push(row);
+    if (blockedAt !== null) { row.evaluated = false; return; }
+
+    const exLo = prevLo - d.maxShift, exHi = prevHi + d.maxShift;
+    row.reachExpanded = ivJson(exLo, exHi);
+
+    if (d.height + EPS < cumZ) {
+      blockedAt = d.index; blockReason = "height";
+      row.heightOk = false; row.blockReason = "height";
+      row.conflict = { doorHeight: r2(d.height), totalHeight: r2(cumZ), shortage: r2(cumZ - d.height) };
+      reachIvs.push([Infinity, -Infinity]);
+      return;
+    }
+
+    let lo = -Infinity, hi = Infinity;
+    slabs.forEach((s) => {
+      lo = Math.max(lo, openL - s.left);
+      hi = Math.min(hi, openR - s.right);
+    });
+    row.interval = ivJson(lo, hi);
+    if (lo > hi + EPS) {
+      blockedAt = d.index; blockReason = "width";
+      row.intervalEmpty = true; row.blockReason = "width";
+      row.conflict = {
+        doorWidth: r2(d.width), envelopeWidth: r2(envR - envL),
+        shortage: r2(lo - hi), interval: ivJson(lo, hi),
+      };
+      reachIvs.push([Infinity, -Infinity]);
+      return;
+    }
+
+    const rLo = Math.max(exLo, lo), rHi = Math.min(exHi, hi);
+    if (rLo > rHi + EPS) {
+      blockedAt = d.index; blockReason = "reach";
+      row.blockReason = "reach";
+      row.conflict = {
+        side: lo > exHi ? "right" : "left",
+        shortage: r2(rLo - rHi),
+        reachExpanded: ivJson(exLo, exHi),
+        doorInterval: ivJson(lo, hi),
+      };
+      reachIvs.push([Infinity, -Infinity]);
+      return;
+    }
+    row.reachable = ivJson(rLo, rHi);
+    row.passable = true;
+    prevLo = rLo; prevHi = rHi;
+    reachIvs.push([rLo, rHi]);
+  });
+
+  let positions = null;
+  if (blockedAt === null && m > 0) {
+    const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+    const chosen = new Array(m).fill(0);
+    let cur = clamp(0, reachIvs[m - 1][0], reachIvs[m - 1][1]);
+    chosen[m - 1] = cur;
+    for (let k = m - 2; k >= 0; k--) cur = clamp(cur, reachIvs[k][0], reachIvs[k][1]), chosen[k] = cur;
+
+    positions = [];
+    let prevShift = 0;
+    rows.forEach((row, k) => {
+      const shift = chosen[k], move = shift - prevShift;
+      row.chosenShift = r2(shift);
+      row.move = r2(move);
+      row.clearance = {
+        left: r2(Math.max(0, (envL + shift) - (doors[k].center - doors[k].width / 2))),
+        right: r2(Math.max(0, (doors[k].center + doors[k].width / 2) - (envR + shift))),
+        top: r2(Math.max(0, doors[k].height - cumZ)),
+      };
+      positions.push({ door: k, shift: r2(shift), move: r2(move), maxShift: r2(doors[k].maxShift), clearance: row.clearance });
+      prevShift = shift;
+    });
+  }
+
+  return {
+    ok: true, evaluable: true, reason: null, profile, doorCount: m,
+    passable: blockedAt === null, blockedAt, blockReason,
+    doors: rows, positions,
+    note: m === 0 ? "未录入窑门，按全程可达处理（没有需要通过的门）" : null,
   };
 }

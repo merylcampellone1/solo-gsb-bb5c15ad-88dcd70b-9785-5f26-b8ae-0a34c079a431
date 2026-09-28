@@ -204,6 +204,31 @@
         <div id="seqOutput"></div>
       </div>
 
+      <div class="panel door-panel">
+        <div class="sim-head">
+          <h2>🚪 连续窑门通行试算 <span id="doorStatus" class="badge">未试算</span></h2>
+          <div class="suggest-actions">
+            <button id="btnCancelDoor" class="btn btn-ghost" type="button" disabled>✕ 清空试算</button>
+            <button id="btnDoor" class="btn btn-run" type="button">开始通行试算</button>
+          </div>
+        </div>
+        <p class="hint">
+          按<b>行进顺序</b>录入每道窑门的<b>开口横向中心、宽度、高度</b>以及进入该门前<b>本段最大横移量</b>
+          （单位均为 mm），首门从横移 <b>0</b> 出发。后端由<b>窑车台面与各层棚板</b>求横向外廓、
+          <b>累加层高</b>求最高点；逐门给出可通过的横移<b>闭区间</b>（<b>高度不足直接阻断</b>），
+          再按门序把上一可达区间按本段横移量<b>扩张</b>后与本门区间<b>求交</b>——
+          <b>首次交集为空即在该门阻断</b>（即使各门单独能过）。全程可达时回溯一条满足各段横移限制的
+          <b>位置序列</b>，逐门列出<b>左 / 右 / 顶部净空</b>。试算只读取当前架体、<span class="hl">不写盘</span>；
+          <b>架体或门参数改变后旧结果立即失效</b>。
+        </p>
+        <div class="door-editor-head">
+          <span>窑门序列（自上而下为行进顺序）</span>
+          <button id="btnAddDoor" class="btn-add-post" type="button" style="width:auto;padding:2px 10px">＋ 增加一道门</button>
+        </div>
+        <div id="doorList"></div>
+        <div id="doorOutput"></div>
+      </div>
+
       <div class="bottom-grid">
         <div class="panel issues-panel">
           <h2>告警与判定 <span id="issueCount" class="badge"></span></h2>

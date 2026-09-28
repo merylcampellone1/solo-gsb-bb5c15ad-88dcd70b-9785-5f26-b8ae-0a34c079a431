@@ -1930,3 +1930,344 @@ def loading_sequence(
         )["step"],
         "allStable": all_stable,
     }
+
+
+# --------------------------------------------------------------------------
+# 连续窑门通行试算（Kiln Door Passage Trial）
+#
+# 架体（窑车）载着层架沿直线依次通过若干道窑门，每道门只允许在进入该门之前
+# 的一段行程内做不超过 maxShift mm 的横向平移（横移量）：
+#   * 横向外廓只取*窑车台面与各层棚板*的 X 向跨度：台面 z=0 上 [0, car.w]；
+#     第 i 层棚板位于累计高度 H_i=Σ_{k≤i} height_k，横向 [board.x, board.x+w]。
+#   * 架体最高点 totalHeight = Σ height（累加层高），与棚板自重/坯件无关。
+#   * 第 j 道门开口横向 [c_j-w_j/2, c_j+w_j/2]、净高 h_j。
+#     - h_j < totalHeight：高度不足，直接判该门阻断（不再给横移区间）；
+#     - 否则本门可通过的横移闭区间 = 所有外廓件区间之交：
+#         s ∈ [max_k(openL-left_k), min_k(openR-right_k)]，
+#       该区间自身为空即单门宽度不足（即使别的门都能过也阻断）。
+#   * 可达性按门序递推：首门前位置为 {0}；进入第 j 道门前把上一道门后的
+#     可达闭区间按本段 maxShift 扩张 [lo-m, hi+m]，再与本门可通过区间求交；
+#     首次交集为空即在该门阻断（"各门单独能过但序列不可达"同样判阻断）。
+#   * 全程可达时回溯一条确定的位置序列：末门取可达区间中最接近 0 的横移，
+#     自后向前把上一道门位置取为可达区间内最接近下一门位置的值（clamp），
+#     逐门给出实际横移与左/右/顶部净空。
+# 整个过程只读、不修改输入、不写盘。
+# --------------------------------------------------------------------------
+DOOR_PASSAGE_EPS = 1e-9  # 闭区间接触（净空 0）即可通过的判定容差（mm）
+
+
+def _parse_door_params(raw_doors: Any) -> List[Dict[str, float]]:
+    """把窑门录入解析为有序列表；非数值/越界值抛 ValueError（API → 400）。"""
+    if not isinstance(raw_doors, list):
+        raise ValueError("窑门参数 doors 必须是数组")
+    fields = (
+        ("center", "开口横向中心"),
+        ("width", "开口宽度"),
+        ("height", "开口高度"),
+        ("maxShift", "本段最大横移量"),
+    )
+    out: List[Dict[str, float]] = []
+    for i, d in enumerate(raw_doors):
+        label = f"第 {i + 1} 道门"
+        if not isinstance(d, dict):
+            raise ValueError(f"{label}的参数必须是对象")
+        vals: Dict[str, float] = {}
+        for key, name in fields:
+            v = d.get(key)
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                raise ValueError(f"{label}{name}必须是数值（mm）")
+            if not math.isfinite(fv):
+                raise ValueError(f"{label}{name}必须是有限数值（mm）")
+            vals[key] = fv
+        if vals["width"] <= 0:
+            raise ValueError(f"{label}开口宽度必须大于 0")
+        if vals["height"] <= 0:
+            raise ValueError(f"{label}开口高度必须大于 0")
+        if vals["maxShift"] < 0:
+            raise ValueError(f"{label}本段最大横移量不能为负")
+        out.append({"index": i, **vals})
+    return out
+
+
+def _rack_profile(norm: Dict[str, Any]) -> Tuple[float, float, float,
+                                                 List[Dict[str, Any]]]:
+    """求架体横向外廓与最高点：返回 (总高, 外廓左, 外廓右, 外廓件列表)。
+
+    外廓件只含窑车台面与各层棚板（X 向跨度为正的才计入）；立柱不参与。
+    """
+    car = norm["car"]
+    slabs: List[Dict[str, Any]] = []
+    if car["w"] > 0:
+        slabs.append(
+            {
+                "kind": "car",
+                "name": car["name"],
+                "z": 0.0,
+                "left": 0.0,
+                "right": car["w"],
+                "width": car["w"],
+            }
+        )
+    cum_z = 0.0
+    for L in norm["layers"]:
+        cum_z += L["height"]
+        b = L["board"]
+        if b["w"] > 0:
+            slabs.append(
+                {
+                    "kind": "board",
+                    "name": L["name"],
+                    "z": cum_z,
+                    "left": b["x"],
+                    "right": b["x"] + b["w"],
+                    "width": b["w"],
+                }
+            )
+    if slabs:
+        env_left = min(s["left"] for s in slabs)
+        env_right = max(s["right"] for s in slabs)
+    else:
+        env_left = env_right = 0.0
+    return cum_z, env_left, env_right, slabs
+
+
+def _iv_json(lo: float, hi: float) -> Optional[Dict[str, Optional[float]]]:
+    """闭区间输出：±∞ 端记为 null（无界）。"""
+    return {
+        "lo": None if lo == -math.inf else r2(lo),
+        "hi": None if hi == math.inf else r2(hi),
+    }
+
+
+def door_passage(
+    raw_state: Optional[Dict[str, Any]], raw_doors: Any
+) -> Dict[str, Any]:
+    """连续窑门通行试算：按门序做横移可达闭区间递推并回溯一条位置序列。
+
+    参数
+    ----
+    raw_state : 当前架体输入（不被修改、不被持久化）
+    raw_doors : 按行进顺序排列的窑门参数列表，每项
+                {"center","width","height","maxShift"}（单位 mm）；
+                非法值抛 ValueError（Flask 层转 400）。
+
+    返回
+    ----
+    evaluable=False（无层）时给出 reason；否则给出架体外廓 profile、逐门
+    判定（本门区间/扩张区间/可达区间/阻断原因与冲突量），passable 为真时
+    附回溯的 positions（每门选定横移、实际横移与左/右/顶部净空）。
+    """
+    doors_in = _parse_door_params(raw_doors)
+    norm = normalize(raw_state)
+    n = len(norm["layers"])
+    total_h, env_l, env_r, slabs = _rack_profile(norm)
+
+    profile = {
+        "totalHeight": r2(total_h),
+        "envelope": {
+            "left": r2(env_l),
+            "right": r2(env_r),
+            "width": r2(env_r - env_l),
+        },
+        "slabs": [
+            {
+                "kind": s["kind"],
+                "name": s["name"],
+                "z": r2(s["z"]),
+                "left": r2(s["left"]),
+                "right": r2(s["right"]),
+                "width": r2(s["width"]),
+            }
+            for s in slabs
+        ],
+    }
+
+    def echo(d: Dict[str, float]) -> Dict[str, Any]:
+        return {
+            "index": d["index"],
+            "center": r2(d["center"]),
+            "width": r2(d["width"]),
+            "height": r2(d["height"]),
+            "maxShift": r2(d["maxShift"]),
+            "opening": {
+                "left": r2(d["center"] - d["width"] / 2.0),
+                "right": r2(d["center"] + d["width"] / 2.0),
+            },
+        }
+
+    if n == 0:
+        return {
+            "evaluable": False,
+            "reason": "当前架体没有任何层，无法确定横向外廓与累计层高，不能进行窑门通行试算",
+            "profile": profile,
+            "doorCount": len(doors_in),
+            "passable": False,
+            "blockedAt": None,
+            "blockReason": None,
+            "doors": [echo(d) for d in doors_in],
+            "positions": None,
+            "note": None,
+        }
+
+    m = len(doors_in)
+    rows: List[Dict[str, Any]] = []
+    reach_ivs: List[Tuple[float, float]] = []  # 各门可达区间（精确浮点，供回溯）
+    prev_lo = prev_hi = 0.0  # 首门之前的位置集合 {0}
+    blocked_at: Optional[int] = None
+    block_reason: Optional[str] = None
+
+    for d in doors_in:
+        i = d["index"]
+        open_l = d["center"] - d["width"] / 2.0
+        open_r = d["center"] + d["width"] / 2.0
+        row: Dict[str, Any] = {
+            **echo(d),
+            "evaluated": True,
+            "heightOk": True,
+            "interval": None,
+            "intervalEmpty": False,
+            "reachExpanded": None,
+            "reachable": None,
+            "passable": False,
+            "blockReason": None,
+            "conflict": None,
+            "chosenShift": None,
+            "move": None,
+            "clearance": None,
+        }
+        rows.append(row)
+
+        if blocked_at is not None:
+            # 阻断门之后不再评估（递推已无法继续）
+            row["evaluated"] = False
+            continue
+
+        # 进入本门前，把上一可达区间按本段最大横移量扩张
+        ex_lo = prev_lo - d["maxShift"]
+        ex_hi = prev_hi + d["maxShift"]
+        row["reachExpanded"] = _iv_json(ex_lo, ex_hi)
+
+        # 高度不足：直接阻断，不再给可通过横移区间
+        if d["height"] + DOOR_PASSAGE_EPS < total_h:
+            blocked_at = i
+            block_reason = "height"
+            row["heightOk"] = False
+            row["blockReason"] = "height"
+            row["conflict"] = {
+                "doorHeight": r2(d["height"]),
+                "totalHeight": r2(total_h),
+                "shortage": r2(total_h - d["height"]),
+            }
+            reach_ivs.append((math.inf, -math.inf))  # 空区间占位，回溯不会用到
+            continue
+
+        # 本门可通过横移闭区间：所有外廓件平移后必须落在开口内
+        lo = max((open_l - s["left"] for s in slabs), default=-math.inf)
+        hi = min((open_r - s["right"] for s in slabs), default=math.inf)
+        row["interval"] = _iv_json(lo, hi)
+        interval_empty = lo > hi + DOOR_PASSAGE_EPS
+
+        if interval_empty:
+            # 单门宽度不足（本门区间自身为空）
+            blocked_at = i
+            block_reason = "width"
+            row["intervalEmpty"] = True
+            row["blockReason"] = "width"
+            gap = lo - hi
+            row["conflict"] = {
+                "doorWidth": r2(d["width"]),
+                "envelopeWidth": r2(env_r - env_l),
+                "shortage": r2(gap),
+                "interval": _iv_json(lo, hi),
+            }
+            reach_ivs.append((math.inf, -math.inf))  # 空区间占位，回溯不会用到
+            continue
+
+        reach_lo = max(ex_lo, lo)
+        reach_hi = min(ex_hi, hi)
+        if reach_lo > reach_hi + DOOR_PASSAGE_EPS:
+            # 本门单独能过，但按本段横移量扩张后的可达区间与本门区间无交集
+            blocked_at = i
+            block_reason = "reach"
+            row["blockReason"] = "reach"
+            if lo > ex_hi:
+                # 本门区间整体在扩张区间右侧：需要继续向右，但本段横移量不够
+                side = "right"
+            else:
+                # 本门区间整体在扩张区间左侧：需要继续向左，但本段横移量不够
+                side = "left"
+            gap = reach_lo - reach_hi
+            row["conflict"] = {
+                "side": side,
+                "shortage": r2(gap),
+                "reachExpanded": _iv_json(ex_lo, ex_hi),
+                "doorInterval": _iv_json(lo, hi),
+            }
+            reach_ivs.append((math.inf, -math.inf))  # 空区间占位，回溯不会用到
+            continue
+
+        row["reachable"] = _iv_json(reach_lo, reach_hi)
+        row["passable"] = True
+        prev_lo, prev_hi = reach_lo, reach_hi
+        reach_ivs.append((reach_lo, reach_hi))
+
+    # ---- 回溯一条满足各段横移限制的位置序列 ----
+    positions: Optional[List[Dict[str, Any]]] = None
+    if blocked_at is None and m > 0:
+        def clamp(v: float, lo: float, hi: float) -> float:
+            return min(max(v, lo), hi)
+
+        chosen: List[float] = [0.0] * m
+        cur = clamp(0.0, *reach_ivs[m - 1])
+        chosen[m - 1] = cur
+        for k in range(m - 2, -1, -1):
+            cur = clamp(cur, *reach_ivs[k])
+            chosen[k] = cur
+
+        positions = []
+        prev_shift = 0.0  # 首门从横移 0 出发
+        for k, row in enumerate(rows):
+            shift = chosen[k]
+            move = shift - prev_shift
+            assert abs(move) <= doors_in[k]["maxShift"] + 1e-7
+            rlo, rhi = reach_ivs[k]
+            assert rlo - 1e-7 <= shift <= rhi + 1e-7
+            dd = doors_in[k]
+            open_lo = dd["center"] - dd["width"] / 2.0
+            open_hi = dd["center"] + dd["width"] / 2.0
+            row["chosenShift"] = r2(shift)
+            row["move"] = r2(move)
+            row["clearance"] = {
+                "left": r2(max(0.0, (env_l + shift) - open_lo)),
+                "right": r2(max(0.0, open_hi - (env_r + shift))),
+                "top": r2(max(0.0, dd["height"] - total_h)),
+            }
+            positions.append(
+                {
+                    "door": k,
+                    "shift": r2(shift),
+                    "move": r2(move),
+                    "maxShift": r2(doors_in[k]["maxShift"]),
+                    "clearance": row["clearance"],
+                }
+            )
+            prev_shift = shift
+
+    note = None
+    if m == 0:
+        note = "未录入窑门，按全程可达处理（没有需要通过的门）"
+
+    return {
+        "evaluable": True,
+        "reason": None,
+        "profile": profile,
+        "doorCount": m,
+        "passable": blocked_at is None,
+        "blockedAt": blocked_at,
+        "blockReason": block_reason,
+        "doors": rows,
+        "positions": positions,
+        "note": note,
+    }
