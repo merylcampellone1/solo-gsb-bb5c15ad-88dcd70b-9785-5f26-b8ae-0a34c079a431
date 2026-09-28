@@ -204,6 +204,36 @@
         <div id="seqOutput"></div>
       </div>
 
+      <div class="panel gate-panel">
+        <div class="sim-head">
+          <h2>🚪 连续窑门通行试算 <span id="gateStatus" class="badge">未试算</span></h2>
+          <div class="suggest-actions">
+            <button id="btnAddGate" class="btn btn-ghost" type="button">＋ 增加一道门</button>
+            <button id="btnCancelGate" class="btn btn-ghost" type="button" disabled>✕ 清空试算</button>
+            <button id="btnGate" class="btn btn-run" type="button">开始通行试算</button>
+          </div>
+        </div>
+        <p class="hint">
+          沿<b>窑车行进顺序</b>录入每道门的<b>开口横向中心、宽度、高度</b>与<b>本段（自上一道门到本门）最大横移量</b>，
+          单位均为 mm；首门的最大横移量对应<b>从横移 0 的发车点到首门</b>这段。后端取<b>窑车台面与各层棚板</b>在
+          横移轴上投影的<b>并包络</b>作为横向外廓，<b>累加各层层高</b>求最高点；逐门计算可通过的横移闭区间，
+          <b>高度不足直接判阻断</b>，再按门序把上一道门的可达区间按本段横移量扩张后与本门区间求交——
+          <b>首次交集为空即阻断并指出区间冲突（各门单独能过也不算可通行）</b>。全程可达时回溯一条满足各段
+          横移限制的位置序列，逐门给出<b>左 / 右 / 顶部净空</b>。试算<span class="hl">只读取当前架体、不写盘</span>；
+          架体或任一门参数改变后旧结果立即失效。
+        </p>
+        <div class="overturn-form gate-axis-form">
+          <label>窑车行进方向（横移为另一轴）
+            <select id="gateAxis">
+              <option value="y">沿 Y 行进 · 横向为 X</option>
+              <option value="x">沿 X 行进 · 横向为 Y</option>
+            </select>
+          </label>
+        </div>
+        <div id="gateList" class="gate-list"></div>
+        <div id="gateOutput"></div>
+      </div>
+
       <div class="bottom-grid">
         <div class="panel issues-panel">
           <h2>告警与判定 <span id="issueCount" class="badge"></span></h2>

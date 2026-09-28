@@ -27,6 +27,14 @@ POST /api/loading-sequence
                      （至多 12 层）按整层一次加入；对各已装子集求抗倾覆带符号裕量，
                      用动态规划求全过程最小裕量最大的装货顺序（同分按层序号字典序）；
                      只计算，不写盘；前置条件不足或候选层超过 12 时返回 planable=false
+POST /api/gate-pass  连续窑门通行试算：body {"state"(可省), "travelAxis": "y",
+                     "gates": [{"name"(可省), "center": 0, "width": 1500,
+                     "height": 1200, "maxShift": 50}, ...]}（单位 mm，沿行进顺序），
+                     由台面/棚板横移轴投影外廓与累加层高点，逐门求可通过横移闭区间，
+                     按门序用上一段可达区间按本段横移量扩张后与本门区间求交，
+                     高度不足直接判阻断；首次交集为空时指出阻断门与区间冲突；
+                     全程可达时回溯横移位置序列并逐门给出左/右/顶部净空；
+                     只计算，不写盘；门参数非法（缺字段/宽高<=0）返回 400
 POST /api/reset      恢复内置示例数据
 """
 
@@ -40,6 +48,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from .calc import (
     calculate,
+    gate_pass,
     load_shed,
     loading_sequence,
     overturn_check,
@@ -210,6 +219,25 @@ def api_loading_sequence():
     # 加速度分量非法（非数字）→ 400；前置条件不足（无承托/凸包退化/超 12 层等）属于正常结果 → 200 + planable=false
     try:
         result = loading_sequence(state, payload.get("ax", 0), payload.get("ay", 0))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/gate-pass", methods=["POST"])
+def api_gate_pass():
+    """连续窑门通行试算：横移闭区间递推/求交与净空回溯。只计算，不写盘、不改已保存状态。"""
+    payload = request.get_json(force=True, silent=True)
+    payload = payload if isinstance(payload, dict) else {}
+    state = payload.get("state")
+    if not isinstance(state, dict):
+        state = load_state()
+    # 门参数/行进方向非法（缺字段、非数值、宽高<=0、负横移量）→ 400；
+    # 高度不足/区间冲突属于正常试算结果 → 200 + passable=false
+    try:
+        result = gate_pass(
+            state, payload.get("gates"), payload.get("travelAxis", "y")
+        )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"ok": True, **result})

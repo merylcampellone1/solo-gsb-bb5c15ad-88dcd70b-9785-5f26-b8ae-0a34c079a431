@@ -56,6 +56,23 @@ let seqReqSeq = 0;             // 请求序号，丢弃过期响应
 let seqErr = null;             // 最近一次参数错误提示（400）
 let seqTimer = null;           // 加速度输入变化后的防抖重算
 
+/* ================= 连续窑门通行试算状态 =================
+ * gateRows 是门参数编辑表（会话内，不随架体持久化）；gateData 只来自
+ * POST /api/gate-pass（或离线兜底），只读不写盘；架体或门参数一旦改变
+ * 旧结果立即作废（invalidateGate），需要重新试算。
+ */
+const DEFAULT_GATE_ROWS = [
+  { name: "第1道门", center: 650, width: 1400, height: 1100, maxShift: 0 },
+  { name: "第2道门", center: 650, width: 1400, height: 1100, maxShift: 100 },
+  { name: "第3道门", center: 650, width: 1400, height: 1100, maxShift: 100 },
+];
+let gateRows = DEFAULT_GATE_ROWS.map((g) => ({ ...g }));
+let gateData = null;            // 最近一次通行试算结果
+let gateErr = null;             // 最近一次参数错误提示（400）
+let gateReqSeq = 0;             // 请求序号，丢弃过期响应
+let gateTimer = null;           // 门参数变化后的防抖重算
+const GATE_COLOR = "#ff9d5c";
+
 /* ================= 数值/工具 ================= */
 const $ = (sel) => document.querySelector(sel);
 const fmt = (v) => (Math.round(v * 100) / 100).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
@@ -123,6 +140,8 @@ async function recalcAndRender(applyChange) {
   invalidateOverturn({ silent: true });
   // 逐层装货顺序规划同样只依赖架体几何/重量：任何编辑都使旧规划作废
   invalidateSequence({ silent: true });
+  // 连续窑门通行试算的外廓/最高点只由架体几何决定：任何编辑都使旧结果作废
+  invalidateGate({ silent: true });
   suggestAppliedMsg = null;
   if (applyChange !== "shed") shedAppliedMsg = null;
   try {
@@ -381,6 +400,7 @@ $("#btnReset").addEventListener("click", async () => {
   invalidateShed({ silent: true });
   invalidateOverturn({ silent: true });
   invalidateSequence({ silent: true });
+  invalidateGate({ silent: true });
   suggestAppliedMsg = null;
   shedAppliedMsg = null;
   renderEditor(); renderResults(); markLayerBadges();
@@ -408,6 +428,7 @@ function renderResults() {
   renderShedPanel();
   renderOverturnPanel();
   renderSeqPanel();
+  renderGatePanel();
 }
 
 function renderTotals() {
@@ -1901,6 +1922,271 @@ $("#btnCancelSeq").addEventListener("click", cancelSequence);
   });
 });
 
+/* ================= 连续窑门通行试算面板 ================= */
+/* 架体或门参数发生编辑：上次试算立即作废（试算只读，不存在确认写入） */
+function invalidateGate(opts) {
+  gateData = null;
+  gateErr = null;
+  gateReqSeq++;
+  clearTimeout(gateTimer);
+  if (!opts || !opts.silent) renderGatePanel();
+}
+
+function renderGateRows() {
+  const list = $("#gateList");
+  if (!list) return;
+  list.innerHTML = "";
+  gateRows.forEach((g, i) => {
+    const row = document.createElement("div");
+    row.className = "gate-row";
+    row.innerHTML = `
+      <div class="gate-idx">${i === 0 ? "发车→" : ""}<b>${i + 1}</b></div>
+      <label>门名称 <input type="text" data-gf="name" value="${escapeHtml(g.name || `第${i + 1}道门`)}"></label>
+      <label>开口横向中心 <input type="number" step="any" data-gf="center" value="${g.center}"></label>
+      <label>开口宽度 <input type="number" step="any" data-gf="width" value="${g.width}"></label>
+      <label>开口高度 <input type="number" step="any" data-gf="height" value="${g.height}"></label>
+      <label>${i === 0 ? "发车段最大横移" : "本段最大横移"} <input type="number" step="any" data-gf="maxShift" value="${g.maxShift}"></label>
+      <button class="btn-del gate-del" data-gate-act="del" title="删除本道门" type="button">✕</button>`;
+    list.appendChild(row);
+  });
+}
+
+function collectGateRows() {
+  gateRows = [...document.querySelectorAll("#gateList .gate-row")].map((row, i) => ({
+    name: row.querySelector('[data-gf="name"]').value.trim() || `第${i + 1}道门`,
+    center: num(row.querySelector('[data-gf="center"]').value),
+    width: num(row.querySelector('[data-gf="width"]').value),
+    height: num(row.querySelector('[data-gf="height"]').value),
+    maxShift: num(row.querySelector('[data-gf="maxShift"]').value),
+  }));
+  return gateRows;
+}
+
+function gateTravelAxis() {
+  return $("#gateAxis").value === "x" ? "x" : "y";
+}
+
+/* 门参数输入：采集后旧结果立即失效，并防抖自动重算（与抗倾覆/装货面板一致） */
+$("#gateList").addEventListener("input", () => {
+  collectGateRows();
+  invalidateGate();
+  clearTimeout(gateTimer);
+  gateTimer = setTimeout(() => { if (gateRows.length) runGate(); }, 300);
+});
+
+$("#gateList").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-gate-act]");
+  if (!btn) return;
+  const row = e.target.closest(".gate-row");
+  const i = [...document.querySelectorAll("#gateList .gate-row")].indexOf(row);
+  collectGateRows();
+  gateRows.splice(i, 1);
+  renderGateRows();
+  invalidateGate();
+  clearTimeout(gateTimer);
+  gateTimer = setTimeout(() => { if (gateRows.length) runGate(); }, 300);
+});
+
+$("#btnAddGate").addEventListener("click", () => {
+  collectGateRows();
+  const i = gateRows.length;
+  const prev = gateRows[i - 1] || { center: 650, width: 1400, height: 1100, maxShift: 100 };
+  gateRows.push({ name: `第${i + 1}道门`, center: prev.center, width: prev.width, height: prev.height, maxShift: 100 });
+  renderGateRows();
+  invalidateGate();
+  clearTimeout(gateTimer);
+  gateTimer = setTimeout(runGate, 300);
+});
+
+$("#gateAxis").addEventListener("change", () => {
+  invalidateGate();
+  clearTimeout(gateTimer);
+  gateTimer = setTimeout(runGate, 150);
+});
+
+async function runGate() {
+  if (!state) return;
+  collectGateRows();
+  if (!gateRows.length) {
+    gateData = null;
+    gateErr = "请至少录入一道窑门";
+    renderGatePanel();
+    return;
+  }
+  const travelAxis = gateTravelAxis();
+  const gates = gateRows.map((g, i) => ({
+    name: g.name || `第${i + 1}道门`,
+    center: g.center, width: g.width, height: g.height, maxShift: g.maxShift,
+  }));
+  // 前端先做一道轻量校验（与后端一致：宽/高必须 > 0、横移量非负）
+  for (let i = 0; i < gates.length; i++) {
+    const g = gates[i];
+    if (!(g.width > 0) || !(g.height > 0) || !(g.maxShift >= 0)) {
+      gateData = null;
+      gateErr = `第 ${i + 1} 道门参数无效：开口宽度、高度必须大于 0，本段最大横移量不能为负`;
+      renderGatePanel();
+      return;
+    }
+  }
+  const status = $("#gateStatus");
+  gateErr = null;
+  status.textContent = "试算中…";
+  status.className = "badge has-gate";
+  const seq = ++gateReqSeq;
+  let data;
+  try {
+    const res = await fetch("/api/gate-pass", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state, gates, travelAxis }),
+    });
+    data = await res.json().catch(() => null);
+    if (!res.ok) {
+      if (seq !== gateReqSeq) return;
+      gateData = null;
+      gateErr = (data && data.error) || `试算失败（HTTP ${res.status}）`;
+      renderGatePanel();
+      return;
+    }
+  } catch (e) {
+    data = gatePassLocal(state, gates, travelAxis); // 离线兜底：与后端同一套算法
+  }
+  if (seq !== gateReqSeq) return; // 期间已有编辑/重置，丢弃过期响应
+  gateData = data;
+  renderGatePanel();
+}
+
+function cancelGate() {
+  invalidateGate();
+}
+
+function intervalText(r) {
+  return r ? `[${fmt(r.lo)}, ${fmt(r.hi)}]` : "—";
+}
+
+function renderGatePanel() {
+  const out = $("#gateOutput");
+  const status = $("#gateStatus");
+  const btnCancel = $("#btnCancelGate");
+  if (!out) return;
+  btnCancel.disabled = !gateData && !gateErr;
+
+  if (gateErr) {
+    status.textContent = "参数有误";
+    status.className = "badge";
+    out.innerHTML = `<p class="ov-reason">⚠ ${escapeHtml(gateErr)}</p>`;
+    return;
+  }
+  if (!gateData) {
+    status.textContent = "未试算";
+    status.className = "badge";
+    out.innerHTML = `<p class="muted" style="margin:8px 0 0">沿行进顺序录好窑门参数后点击「开始通行试算」。
+      试算只读取当前架体、不写盘；架体或任一门参数改变后旧结果立即作废。</p>`;
+    return;
+  }
+
+  const d = gateData;
+  const p = d.profile;
+  const profileItems = p.items.map((it) =>
+    `<li>${it.kind === "car" ? "台面" : `棚板·${it.name}`}：[${fmt(it.lo)}, ${fmt(it.hi)}] mm</li>`).join("");
+
+  const head = `
+    <div class="gate-profile">
+      <div class="ov-metrics">
+        <div class="ov-metric"><span>横向外廓（${p.lateralAxis.toUpperCase()} 轴并包络）</span><b>[${fmt(p.lo)}, ${fmt(p.hi)}]</b><small>宽度 ${fmt(p.width)} mm</small></div>
+        <div class="ov-metric"><span>架体最高点（累加层高）</span><b>${fmt(p.topHeight)}</b><small>mm</small></div>
+        <div class="ov-metric"><span>窑门数量</span><b>${d.gateCount}</b><small>道（沿行进顺序）</small></div>
+        <div class="ov-metric ${d.passable ? "good" : "bad"}"><span>判定</span><b>${d.passable ? "✓ 全程可通行" : "✕ 阻断"}</b><small>${d.passable ? "存在满足各段横移限制的位置序列" : `阻断于${d.blockedGateName}`}</small></div>
+      </div>
+      <details class="gate-items"><summary>外廓构成（台面 / 各层棚板横移轴投影）</summary><ul class="sug-issues">${profileItems}</ul></details>
+    </div>`;
+
+  const rows = d.doors.map((g) => {
+    const blockedHere = d.blockedAt === g.index;
+    const reached = g.reached;
+    const passCls = reached ? "good" : blockedHere ? "bad" : "muted-cell";
+    let verdict;
+    if (blockedHere && d.blockKind === "height") verdict = "🔴 高度阻断";
+    else if (blockedHere && d.blockKind === "own-width") verdict = "🔴 单门过窄";
+    else if (blockedHere) verdict = "🔴 区间冲突";
+    else if (!reached) verdict = "⚪ 未到达";
+    else verdict = "🟢 可通过";
+    return `<tr class="${blockedHere ? "target" : ""}">
+      <td>${g.index + 1}</td>
+      <td><b>${escapeHtml(g.name)}</b></td>
+      <td>${fmt(g.center)}<small> 宽 ${fmt(g.width)} / 高 ${fmt(g.height)}</small></td>
+      <td>${intervalText(g.ownRange)}${g.ownPassable ? "" : '<br><span class="up2">外廓超出开口</span>'}${g.heightPassable ? "" : '<br><span class="up2">高度不足</span>'}</td>
+      <td>${intervalText(g.expandedRange)}</td>
+      <td class="${reached ? "good" : blockedHere ? "bad" : ""}">${intervalText(g.reachRange)}</td>
+      <td>${g.shift == null ? "—" : fmt(g.shift)}<small>${g.move == null ? "" : ` 移动 ${fmt(g.move)} / ≤ ${fmt(g.maxShift)}`}</small></td>
+      <td>${g.clearance ? `左 <b>${fmt(g.clearance.left)}</b><br>右 <b>${fmt(g.clearance.right)}</b><br>顶 <b>${fmt(g.clearance.top)}</b>` : "—"}</td>
+      <td class="${passCls}">${verdict}</td>
+    </tr>`;
+  }).join("");
+
+  const table = `
+    <div class="ov-table-wrap">
+      <table class="src-table sug-table ov-table gate-table">
+        <tr class="head">
+          <td>#</td><td>窑门</td><td>中心 / 宽 × 高 mm</td>
+          <td>本门可通过横移区间</td><td>上段扩张区间</td><td>交集（可达区间）</td>
+          <td>所选横移 mm</td><td>左/右/顶部净空 mm</td><td>判定</td>
+        </tr>
+        ${rows}
+      </table>
+    </div>`;
+
+  if (!d.passable) {
+    status.textContent = "阻断";
+    status.className = "badge has-error";
+    const conflict = d.conflict || {};
+    out.innerHTML = `
+      <p class="ov-verdict overturn"><b>✕ 在第 ${d.blockedAt + 1} 道门「${escapeHtml(d.blockedGateName)}」阻断</b>
+        <span class="sub">即使各门单独能过，只要可达区间衔接不上，整线即不可通行</span></p>
+      <p class="ov-reason">🚫 <b>阻断原因：</b>${escapeHtml(d.blockReason)}</p>
+      <div class="gate-conflict">
+        <span>本段扩张可达区间：<b>${intervalText(conflict.expandedRange)}</b></span>
+        <span>本门单独可通过区间：<b>${intervalText(conflict.ownRange)}</b></span>
+        <span class="muted">交集为空 → 需调整本段横移量或门位后重试</span>
+      </div>
+      ${head}${table}`;
+    return;
+  }
+
+  status.textContent = "全程可通行";
+  status.className = "badge has-gate pass";
+  const posRows = d.positions.map((s, i) => `
+    <tr>
+      <td>${i + 1}</td>
+      <td>${escapeHtml(s.name)}</td>
+      <td><b>${fmt(s.shift)}</b></td>
+      <td>${i === 0 ? "自横移 0 的发车点" : `相对上一道门移动 ${fmt(s.move)} mm`}</td>
+      <td>${fmt(s.move)} / ${fmt(s.maxShift)}</td>
+    </tr>`).join("");
+  out.innerHTML = `
+    <p class="ov-verdict stable"><b>✓ ${d.gateCount} 道门全程可通行</b>
+      <span class="sub">已回溯一条满足各段横移限制的位置序列（首段自横移 0 的发车点起）</span></p>
+    ${head}
+    <div class="gate-clr">
+      <div class="ov-metric good"><span>最小左净空</span><b>${fmt(d.minClearance.left)}</b><small>mm</small></div>
+      <div class="ov-metric good"><span>最小右净空</span><b>${fmt(d.minClearance.right)}</b><small>mm</small></div>
+      <div class="ov-metric good"><span>最小顶部净空</span><b>${fmt(d.minClearance.top)}</b><small>mm</small></div>
+    </div>
+    ${table}
+    <details class="gate-pos" open>
+      <summary>回溯位置序列（逐门横移量，单位 mm）</summary>
+      <div class="ov-table-wrap">
+        <table class="src-table sug-table ov-table">
+          <tr class="head"><td>#</td><td>窑门</td><td>横移位置</td><td>本段来源</td><td>本段移动 / 上限 mm</td></tr>
+          ${posRows}
+        </table>
+      </div>
+    </details>`;
+}
+
+$("#btnGate").addEventListener("click", runGate);
+$("#btnCancelGate").addEventListener("click", cancelGate);
+
 /* ================= 画布随窗口缩放重绘 ================= */
 window.addEventListener("resize", debounce(() => { drawTop(); drawSide(); }, 150));
 
@@ -1920,6 +2206,7 @@ async function init() {
   renderEditor();
   renderResults();
   markLayerBadges();
+  renderGateRows();
   setSaveState("saved", "✓ 就绪 " + new Date().toLocaleTimeString("zh-CN"));
 }
 init();
@@ -2850,5 +3137,170 @@ function loadingSequenceLocal(rawState, ax, ay) {
     supportPoints, supportPointCount: bottomPoints.length,
     order: orderIdx.slice(), steps, initial: steps[0],
     minMargin: r2(minMarginVal), minMarginStep: minStep.step, allStable,
+  };
+}
+
+/* ======================================================================
+ * 连续窑门通行试算离线兜底：与 app/calc.py 的 gate_pass 对齐（只读不存）
+ *
+ * 横向外廓 = 台面与各层棚板在横移轴投影的并包络；最高点 = 各层层高累加。
+ * 本门可通过横移闭区间 own = [c-w/2+profLo, c+w/2-profHi]（高度不足直接阻断）；
+ * reach 自 {0}（发车点）起，逐门按本段最大横移量扩张后与 own 求交，
+ * 首次空交集即阻断；全程可达时自末门回溯位置序列，逐门算左/右/顶部净空。
+ * ==================================================================== */
+function gatePassLocal(rawState, rawGates, travelAxis) {
+  const axis = travelAxis === "x" ? "x" : "y";
+  const lateral = axis === "x" ? "y" : "x";
+  if (!Array.isArray(rawGates) || !rawGates.length) throw new Error("请至少录入一道窑门");
+  const gates = rawGates.map((g0, i) => {
+    if (!g0 || typeof g0 !== "object") throw new Error(`第 ${i + 1} 道门必须是对象`);
+    const f = (v, name) => {
+      const x = parseFloat(v);
+      if (!Number.isFinite(x)) throw new Error(`${name}必须是数值（单位 mm）`);
+      return x;
+    };
+    const center = f(g0.center, `第 ${i + 1} 道门开口横向中心`);
+    const width = f(g0.width, `第 ${i + 1} 道门开口宽度`);
+    const height = f(g0.height, `第 ${i + 1} 道门开口高度`);
+    const maxShift = f(g0.maxShift, `第 ${i + 1} 道门本段最大横移量`);
+    if (width <= 0) throw new Error(`第 ${i + 1} 道门开口宽度必须大于 0`);
+    if (height <= 0) throw new Error(`第 ${i + 1} 道门开口高度必须大于 0`);
+    if (maxShift < 0) throw new Error(`第 ${i + 1} 道门本段最大横移量不能为负`);
+    return { name: (g0.name || `第${i + 1}道门`), center, width, height, maxShift };
+  });
+
+  // 规范化架体（与 calculateLocal 同样的宽容规则；只取几何，重量/立柱无关）
+  const car = {
+    name: (rawState.car && rawState.car.name) || "窑车台面",
+    w: Math.max(0, num(rawState.car && rawState.car.w)),
+    d: Math.max(0, num(rawState.car && rawState.car.d)),
+  };
+  const layers = (rawState.layers || []).map((l0, idx) => {
+    const b0 = l0.board || {};
+    return {
+      id: l0.id || "L" + idx,
+      name: l0.name || "第" + (idx + 1) + "层",
+      height: Math.max(0, num(l0.height)),
+      board: { x: num(b0.x), y: num(b0.y), w: Math.max(0, num(b0.w)), d: Math.max(0, num(b0.d)), weight: Math.max(0, num(b0.weight)) },
+      wareWeight: Math.max(0, num(l0.wareWeight)),
+      posts: (l0.posts || []).map((p0, j) => ({ id: String(p0.id || "P" + (j + 1)), x: num(p0.x), y: num(p0.y), capacity: num(p0.capacity) })),
+    };
+  });
+  const EPS = 1e-9;
+
+  const carSpan = axis === "x" ? car.d : car.w;
+  const items = [{ kind: "car", layer: null, name: car.name, lo: 0, hi: Math.max(0, carSpan) }];
+  let profLo = 0, profHi = Math.max(0, carSpan);
+  layers.forEach((L, i) => {
+    const lo = axis === "x" ? L.board.y : L.board.x;
+    const hi = lo + (axis === "x" ? L.board.d : L.board.w);
+    items.push({ kind: "board", layer: i, name: L.name, lo, hi });
+    if (hi - lo > 0) { profLo = Math.min(profLo, lo); profHi = Math.max(profHi, hi); }
+  });
+  const profWidth = profHi - profLo;
+  const topHeight = layers.reduce((s, L) => s + L.height, 0);
+  const profile = {
+    travelAxis: axis, lateralAxis: lateral,
+    lo: r2(profLo), hi: r2(profHi), width: r2(profWidth), topHeight: r2(topHeight),
+    items: items.map((it) => ({ kind: it.kind, layer: it.layer, name: it.name, lo: r2(it.lo), hi: r2(it.hi) })),
+  };
+
+  const doorRows = [];
+  const reachExact = [];
+  let prevReach = [0, 0]; // 发车点：横移 0
+  let blockedAt = null, blockKind = null, blockReason = null;
+
+  gates.forEach((g, j) => {
+    const half = g.width / 2;
+    const ownLo = g.center - half + profLo;
+    const ownHi = g.center + half - profHi;
+    const ownOk = ownHi + EPS >= ownLo;
+    const heightOk = topHeight <= g.height + EPS;
+    let expanded = null, reach = null;
+    const reached = blockedAt === null && prevReach !== null;
+    if (reached) {
+      expanded = [prevReach[0] - g.maxShift, prevReach[1] + g.maxShift];
+      if (ownOk && heightOk) {
+        const lo = Math.max(expanded[0], ownLo);
+        const hi = Math.min(expanded[1], ownHi);
+        if (hi + EPS >= lo) reach = [lo, hi];
+      }
+    }
+    const row = {
+      index: j, name: g.name, center: r2(g.center), width: r2(g.width),
+      height: r2(g.height), maxShift: r2(g.maxShift),
+      openingLo: r2(g.center - half), openingHi: r2(g.center + half),
+      ownRange: { lo: r2(ownLo), hi: r2(ownHi) },
+      ownPassable: !!ownOk, heightPassable: !!heightOk,
+      expandedRange: expanded ? { lo: r2(expanded[0]), hi: r2(expanded[1]) } : null,
+      reachRange: reach ? { lo: r2(reach[0]), hi: r2(reach[1]) } : null,
+      reached: !!(reached && reach), shift: null, move: null, clearance: null,
+    };
+
+    if (blockedAt === null && reach === null) {
+      blockedAt = j;
+      if (!heightOk) {
+        blockKind = "height";
+        blockReason = `${g.name}开口高度 ${r2(g.height)} mm 低于架体最高点 ${r2(topHeight)} mm（超出 ${r2(topHeight - g.height)} mm），高度不足，阻断`;
+      } else if (!ownOk) {
+        blockKind = "own-width";
+        blockReason = `${g.name}开口宽度 ${r2(g.width)} mm 小于架体横向外廓 ${r2(profWidth)} mm（外廓 [${r2(profLo)}, ${r2(profHi)}]，缺口 ${r2(profWidth - g.width)} mm），即使允许任意横移也无法通过，阻断`;
+      } else {
+        blockKind = "reach";
+        const gapLo = ownLo - expanded[1], gapHi = expanded[0] - ownHi;
+        const side = gapLo > EPS
+          ? `右偏至少 ${r2(gapLo)} mm（开口相对可达范围偏右）`
+          : `左偏至少 ${r2(gapHi)} mm（开口相对可达范围偏左）`;
+        blockReason = `${g.name}与前序位置衔接冲突：本段（最大横移 ${r2(g.maxShift)} mm）扩张后的可达区间 [${r2(expanded[0])}, ${r2(expanded[1])}] 与本门单独可通过区间 [${r2(ownLo)}, ${r2(ownHi)}] 交集为空，需${side}，阻断（前序各门虽可通过，整线仍不可通行）`;
+      }
+    }
+
+    if (reach !== null) prevReach = reach;
+    else if (blockedAt === j) prevReach = null;
+    reachExact.push(reach);
+    doorRows.push(row);
+  });
+
+  const blockResult = () => ({
+    ok: true, passable: false, travelAxis: axis, lateralAxis: lateral,
+    profile, gateCount: gates.length, doors: doorRows, positions: null, minClearance: null,
+    blockedAt, blockedGateName: gates[blockedAt].name, blockKind, blockReason,
+    conflict: { expandedRange: doorRows[blockedAt].expandedRange, ownRange: doorRows[blockedAt].ownRange },
+  });
+  if (blockedAt !== null) return blockResult();
+
+  // 自末门回溯位置序列：优先最靠近下一道门位置
+  const shifts = new Array(gates.length).fill(0);
+  const last = gates.length - 1;
+  shifts[last] = Math.min(Math.max(0, reachExact[last][0]), reachExact[last][1]);
+  for (let j = gates.length - 2; j >= 0; j--) {
+    const lo = Math.max(reachExact[j][0], shifts[j + 1] - gates[j + 1].maxShift);
+    const hi = Math.min(reachExact[j][1], shifts[j + 1] + gates[j + 1].maxShift);
+    shifts[j] = Math.min(Math.max(shifts[j + 1], lo), hi);
+  }
+
+  let minLeft = Infinity, minRight = Infinity, minTop = Infinity;
+  let prevShift = 0;
+  doorRows.forEach((row, j) => {
+    const s = shifts[j], half = gates[j].width / 2;
+    const openLo = gates[j].center - half, openHi = gates[j].center + half;
+    const bodyLo = s + profLo, bodyHi = s + profHi;
+    const left = bodyLo - openLo, right = openHi - bodyHi, top = gates[j].height - topHeight;
+    const move = s - prevShift;
+    prevShift = s;
+    minLeft = Math.min(minLeft, left); minRight = Math.min(minRight, right); minTop = Math.min(minTop, top);
+    row.shift = r2(s); row.move = r2(move);
+    row.clearance = { left: r2(left), right: r2(right), top: r2(top) };
+  });
+
+  return {
+    ok: true, passable: true, travelAxis: axis, lateralAxis: lateral,
+    profile, gateCount: gates.length, doors: doorRows,
+    positions: doorRows.map((row, j) => ({
+      index: j, name: row.name, shift: r2(shifts[j]),
+      move: r2(shifts[j] - (j > 0 ? shifts[j - 1] : 0)), maxShift: r2(gates[j].maxShift),
+    })),
+    minClearance: { left: r2(minLeft), right: r2(minRight), top: r2(minTop) },
+    blockedAt: null, blockedGateName: null, blockKind: null, blockReason: null, conflict: null,
   };
 }

@@ -1930,3 +1930,340 @@ def loading_sequence(
         )["step"],
         "allStable": all_stable,
     }
+
+
+# --------------------------------------------------------------------------
+# 连续窑门通行试算（Gate Passage Check）
+#
+# 窑车沿行进方向依次通过若干道窑门，每道门只在横移方向（与行进方向垂直）
+# 上约束窑车位置：
+#   * 架体横向外廓：窑车台面 [0, carW] 与各层棚板在横移轴上的投影
+#     [b_lo, b_hi] 取并包络 [profLo, profHi]，横向宽度 Wp = profHi − profLo；
+#     与装载/立柱无关——任何一层棚板伸出，都可能刮到门框。
+#   * 架体最高点：台面 z=0 起累加各层层高 H = Σ height_i（棚板在立柱顶端，
+#     顶层棚板即最高点）；与坯件重量无关。
+#
+# 第 j 道门录入横向开口中心 c_j、开口宽度 w_j、开口高度 h_j，以及从第 j−1
+# 道门到本门这段行程允许的最大横移量 m_j（j=0 时第 j−1 道门即“横移 0 的
+# 发车点”，m_0 为发车段允许横移）。横移量 s_j 表示架体坐标系相对门框坐标
+# 系的横向平移（s=0 即静止对齐）：
+#   * 本门单独可通过的横移闭区间 own_j = [c_j − w_j/2 + profLo,
+#       c_j + w_j/2 − profHi]，即架体外廓两端均在开口内（边界贴合算可过）；
+#     H > h_j 时高度不足，直接判阻断（不再参与区间推演）。
+#   * 可达区间递推：reach_{-1} = {0}（发车点），reach_j =
+#       (reach_{j−1} 按本段最大横移量扩张为 [lo−m_j, hi+m_j]) ∩ own_j；
+#     首次交集为空即阻断，并给出两个区间的冲突（即便各门单独都能过，
+#     只要相邻可达范围对不上，整线仍不可通行）。
+#   * 全程可达时从末门起自后向前回溯：末门在 reach 末内取最靠近 0 的点，
+#     其余各门在 reach_j ∩ [s_{j+1} − m_{j+1}, s_{j+1} + m_{j+1}] 内取
+#     最靠近下一道门已选位置的点；天然满足各段 |s_j − s_{j−1}| ≤ m_j
+#     （s_{-1}=0）；逐门给出左/右/顶部净空。
+# --------------------------------------------------------------------------
+GATE_EPS_MM = 1e-9  # 闭区间交集判定容差（mm）：贴合（差 0）算可过
+
+
+def _parse_gate_axis(axis: Any) -> str:
+    """解析行进方向：'x' 横移取 y；'y'（默认）横移取 x。非法值抛 ValueError。"""
+    if axis is None:
+        return "y"
+    a = str(axis).strip().lower()
+    if a in ("y", "y轴", "y-axis", "along_y"):
+        return "y"
+    if a in ("x", "x轴", "x-axis", "along_x"):
+        return "x"
+    raise ValueError("行进方向必须是 'x' 或 'y'（横移为另一轴）")
+
+
+def _parse_finite(v: Any, field: str) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field}必须是数值（单位 mm）")
+    if not math.isfinite(f):
+        raise ValueError(f"{field}必须是有限数值（单位 mm）")
+    return f
+
+
+def _parse_gates(raw_gates: Any) -> List[Dict[str, Any]]:
+    """规范化窑门序列：center/width/height/maxShift 为必填有限数，
+    width/height/maxShift 必须 > 0，否则抛 ValueError（API 层转 400）。"""
+    if not isinstance(raw_gates, list):
+        raise ValueError("请求体 gates 必须是窑门对象数组（沿行进顺序）")
+    if not raw_gates:
+        raise ValueError("请至少录入一道窑门")
+    gates: List[Dict[str, Any]] = []
+    for idx, g in enumerate(raw_gates):
+        if not isinstance(g, dict):
+            raise ValueError(f"第 {idx + 1} 道门必须是对象")
+        tag = f"第 {idx + 1} 道门"
+        center = _parse_finite(g.get("center"), f"{tag}开口横向中心")
+        width = _parse_finite(g.get("width"), f"{tag}开口宽度")
+        height = _parse_finite(g.get("height"), f"{tag}开口高度")
+        max_shift = _parse_finite(g.get("maxShift"), f"{tag}本段最大横移量")
+        if width <= 0:
+            raise ValueError(f"{tag}开口宽度必须大于 0")
+        if height <= 0:
+            raise ValueError(f"{tag}开口高度必须大于 0")
+        if max_shift < 0:
+            raise ValueError(f"{tag}本段最大横移量不能为负")
+        name = str(g.get("name") or "").strip() or f"第{idx + 1}道门"
+        gates.append(
+            {
+                "name": name,
+                "center": center,
+                "width": width,
+                "height": height,
+                "maxShift": max_shift,
+            }
+        )
+    return gates
+
+
+def gate_pass(
+    raw_state: Optional[Dict[str, Any]],
+    raw_gates: Any,
+    travel_axis: Any = "y",
+) -> Dict[str, Any]:
+    """连续窑门通行试算：按门序扩张可达横移区间并逐门求交，给阻断门或回溯位置序列。
+
+    参数
+    ----
+    raw_state    : 当前架体输入（只读取，不被修改、不被持久化）
+    raw_gates    : 窑门数组（沿行进顺序），每项
+                   {"name"(可省), "center", "width", "height", "maxShift"}，单位 mm
+    travel_axis  : 行进方向 'x'/'y'（默认 'y'）；横移为另一轴
+
+    返回
+    ----
+    passable=True 时给出 profile（横向外廓/最高点）、逐门 doorResults（本门区间、
+    可达区间、所选横移、左/右/顶部净空、本段移动量）与 positions（自横移 0
+    的发车点回溯出的横移位置序列，各段移动均不超过本段 maxShift）、minClearance。
+    passable=False 时 blockedAt 指出阻断门序号（0 起）、blockReason 区分
+    height（高度不足）/own-width（单门横向不足）/reach（区间衔接冲突），
+    并给出冲突的“本段扩张可达区间”与“本门可通过区间”；阻断门之后各门标记
+    reached=False，但仍计算其单独可通过区间供排查。
+    参数非法（缺字段/非数值/宽高 ≤ 0）抛 ValueError。
+    """
+    axis = _parse_gate_axis(travel_axis)
+    gates = _parse_gates(raw_gates)
+
+    norm = normalize(raw_state)
+    layers = norm["layers"]
+
+    # ---- 架体横向外廓：台面 + 各层棚板在横移轴上投影的并包络 ----
+    car = norm["car"]
+    span0 = car["d"] if axis == "x" else car["w"]  # 台面在横移轴上的长度
+    items: List[Dict[str, Any]] = [
+        {"kind": "car", "layer": None, "name": car["name"], "lo": 0.0, "hi": max(0.0, span0)}
+    ]
+    prof_lo, prof_hi = 0.0, max(0.0, span0)
+    for i, L in enumerate(layers):
+        b = L["board"]
+        lo = b["y"] if axis == "x" else b["x"]
+        hi = lo + (b["d"] if axis == "x" else b["w"])
+        items.append({"kind": "board", "layer": i, "name": L["name"], "lo": lo, "hi": hi})
+        if hi - lo > 0:
+            prof_lo = min(prof_lo, lo)
+            prof_hi = max(prof_hi, hi)
+    prof_width = prof_hi - prof_lo
+    top_height = sum(L["height"] for L in layers)
+
+    profile = {
+        "travelAxis": axis,
+        "lateralAxis": "y" if axis == "x" else "x",
+        "lo": r2(prof_lo),
+        "hi": r2(prof_hi),
+        "width": r2(prof_width),
+        "topHeight": r2(top_height),
+        "items": [
+            {
+                "kind": it["kind"],
+                "layer": it["layer"],
+                "name": it["name"],
+                "lo": r2(it["lo"]),
+                "hi": r2(it["hi"]),
+            }
+            for it in items
+        ],
+    }
+
+    # ---- 按门序递推可达闭区间 ----
+    door_rows: List[Dict[str, Any]] = []
+    reach_exact: List[Optional[Tuple[float, float]]] = []  # 各门可达区间（精确值，供回溯）
+    prev_reach: Optional[Tuple[float, float]] = (0.0, 0.0)  # 发车点：横移 0
+    blocked_idx: Optional[int] = None
+    blocked_kind: Optional[str] = None
+    blocked_reason: Optional[str] = None
+
+    for j, g in enumerate(gates):
+        half = g["width"] / 2.0
+        own_lo = g["center"] - half + prof_lo
+        own_hi = g["center"] + half - prof_hi
+        own_ok = own_hi + GATE_EPS_MM >= own_lo
+        height_ok = top_height <= g["height"] + GATE_EPS_MM
+
+        expanded: Optional[Tuple[float, float]] = None
+        reach: Optional[Tuple[float, float]] = None
+        # 阻断一旦发生即不再向后传递 prev_reach，故其非空即代表本门仍在可达链上
+        reached = prev_reach is not None
+        if reached:
+            assert prev_reach is not None
+            expanded = (prev_reach[0] - g["maxShift"], prev_reach[1] + g["maxShift"])
+            if own_ok and height_ok:
+                inter_lo = max(expanded[0], own_lo)
+                inter_hi = min(expanded[1], own_hi)
+                if inter_hi + GATE_EPS_MM >= inter_lo:
+                    reach = (inter_lo, inter_hi)
+
+        row: Dict[str, Any] = {
+            "index": j,
+            "name": g["name"],
+            "center": r2(g["center"]),
+            "width": r2(g["width"]),
+            "height": r2(g["height"]),
+            "maxShift": r2(g["maxShift"]),
+            "openingLo": r2(g["center"] - half),
+            "openingHi": r2(g["center"] + half),
+            "ownRange": {"lo": r2(own_lo), "hi": r2(own_hi)},
+            "ownPassable": bool(own_ok),
+            "heightPassable": bool(height_ok),
+            "expandedRange": (
+                {"lo": r2(expanded[0]), "hi": r2(expanded[1])} if expanded else None
+            ),
+            "reachRange": (
+                {"lo": r2(reach[0]), "hi": r2(reach[1])} if reach else None
+            ),
+            "reached": bool(reached and reach is not None),
+            "shift": None,
+            "move": None,
+            "clearance": None,
+        }
+
+        if blocked_idx is None and reach is None:
+            # 首次阻断：高度不足优先；其次单门横向不足；最后区间衔接冲突
+            blocked_idx = j
+            if not height_ok:
+                blocked_kind = "height"
+                blocked_reason = (
+                    f"{g['name']}开口高度 {r2(g['height'])} mm 低于架体最高点 "
+                    f"{r2(top_height)} mm（超出 {r2(top_height - g['height'])} mm），高度不足，阻断"
+                )
+            elif not own_ok:
+                blocked_kind = "own-width"
+                blocked_reason = (
+                    f"{g['name']}开口宽度 {r2(g['width'])} mm 小于架体横向外廓 "
+                    f"{r2(prof_width)} mm（外廓 [{r2(prof_lo)}, {r2(prof_hi)}]，"
+                    f"缺口 {r2(prof_width - g['width'])} mm），即使允许任意横移也无法通过，阻断"
+                )
+            else:
+                blocked_kind = "reach"
+                assert expanded is not None
+                gap_lo = own_lo - expanded[1]
+                gap_hi = expanded[0] - own_hi
+                if gap_lo > GATE_EPS_MM:
+                    side = f"右偏至少 {r2(gap_lo)} mm（开口相对可达范围偏右）"
+                else:
+                    side = f"左偏至少 {r2(gap_hi)} mm（开口相对可达范围偏左）"
+                blocked_reason = (
+                    f"{g['name']}与前序位置衔接冲突：本段（最大横移 {r2(g['maxShift'])} mm）"
+                    f"扩张后的可达区间 [{r2(expanded[0])}, {r2(expanded[1])}] 与本门单独"
+                    f"可通过区间 [{r2(own_lo)}, {r2(own_hi)}] 交集为空，需{side}，阻断"
+                    "（前序各门虽可通过，整线仍不可通行）"
+                )
+
+        if reach is not None:
+            prev_reach = reach
+        elif blocked_idx == j:
+            prev_reach = None  # 阻断后不再向后传递可达区间
+        reach_exact.append(reach)
+        door_rows.append(row)
+
+    if blocked_idx is not None:
+        return {
+            "passable": False,
+            "travelAxis": axis,
+            "lateralAxis": "y" if axis == "x" else "x",
+            "profile": profile,
+            "gateCount": len(gates),
+            "doors": door_rows,
+            "positions": None,
+            "minClearance": None,
+            "blockedAt": blocked_idx,
+            "blockedGateName": gates[blocked_idx]["name"],
+            "blockKind": blocked_kind,
+            "blockReason": blocked_reason,
+            "conflict": {
+                "expandedRange": door_rows[blocked_idx]["expandedRange"],
+                "ownRange": door_rows[blocked_idx]["ownRange"],
+            },
+        }
+
+    # ---- 全程可达：回溯一条满足各段横移限制的位置序列 ----
+    # 发车点固定在横移 0（reach 种子 {0}）；首门 s_0 可在
+    # [−m_0, m_0] ∩ own_0 内（m_0 即发车点→首门这段的最大横移量）。
+    # 自末门起向前回溯：s_j 取“本门可达区间 ∩ 相对下一道门所选位置本段可达”，
+    # 优先最靠近下一道门位置（本段移动最小）；交集非空由递推构造保证。
+    shifts: List[float] = [0.0] * len(gates)
+    last = len(gates) - 1
+    rng_last = reach_exact[last]
+    assert rng_last is not None
+    shifts[last] = min(max(0.0, rng_last[0]), rng_last[1])
+    for j in range(len(gates) - 2, -1, -1):
+        rng = reach_exact[j]
+        assert rng is not None
+        lo = max(rng[0], shifts[j + 1] - gates[j + 1]["maxShift"])
+        hi = min(rng[1], shifts[j + 1] + gates[j + 1]["maxShift"])
+        shifts[j] = min(max(shifts[j + 1], lo), hi)
+
+    min_left = min_right = min_top = math.inf
+    prev_shift = 0.0
+    for j, g in enumerate(gates):
+        s = shifts[j]
+        half = g["width"] / 2.0
+        open_lo, open_hi = g["center"] - half, g["center"] + half
+        body_lo = s + prof_lo
+        body_hi = s + prof_hi
+        left = body_lo - open_lo
+        right = open_hi - body_hi
+        top = g["height"] - top_height
+        move = s - prev_shift
+        prev_shift = s
+        min_left = min(min_left, left)
+        min_right = min(min_right, right)
+        min_top = min(min_top, top)
+        door_rows[j]["shift"] = r2(s)
+        door_rows[j]["move"] = r2(move)
+        door_rows[j]["clearance"] = {
+            "left": r2(left),
+            "right": r2(right),
+            "top": r2(top),
+        }
+
+    return {
+        "passable": True,
+        "travelAxis": axis,
+        "lateralAxis": "y" if axis == "x" else "x",
+        "profile": profile,
+        "gateCount": len(gates),
+        "doors": door_rows,
+        "positions": [
+            {
+                "index": j,
+                "name": gates[j]["name"],
+                "shift": r2(shifts[j]),
+                "move": r2(shifts[j] - (shifts[j - 1] if j > 0 else 0.0)),
+                "maxShift": r2(gates[j]["maxShift"]),
+            }
+            for j in range(len(gates))
+        ],
+        "minClearance": {
+            "left": r2(min_left),
+            "right": r2(min_right),
+            "top": r2(min_top),
+        },
+        "blockedAt": None,
+        "blockedGateName": None,
+        "blockKind": None,
+        "blockReason": None,
+        "conflict": None,
+    }

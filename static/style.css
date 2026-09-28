@@ -403,6 +403,46 @@ ul.sug-issues li.is-removed .itype { color: var(--normal); }
 .ov-verdict.stable b { color: var(--normal); }
 .ov-verdict.overturn b { color: var(--error); }
 
+/* ---------- 连续窑门通行试算 ---------- */
+.gate-panel { border-style: dashed; border-color: #a85f2c; }
+.gate-panel .btn-run { border-color: #ff9d5c; color: #ff9d5c; }
+.gate-panel .btn-run:hover { background: rgba(255,157,92,0.12); }
+.badge.has-gate { color: #ff9d5c; border-color: #ff9d5c; }
+.badge.has-gate.pass { color: var(--normal); border-color: var(--normal); }
+.gate-axis-form { max-width: 420px; margin-bottom: 8px; }
+.gate-axis-form select {
+  background: #0d1322; border: 1px solid var(--line); color: var(--text);
+  border-radius: 6px; padding: 5px 7px; font-size: 12px; width: 100%;
+}
+.gate-axis-form select:focus { outline: none; border-color: #ff9d5c; }
+.gate-list { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.gate-row {
+  display: grid; grid-template-columns: 46px repeat(5, 1fr) auto; gap: 6px;
+  align-items: end; background: #0d1322; border: 1px solid var(--line);
+  border-radius: 7px; padding: 6px 8px;
+}
+.gate-row label { font-size: 10px; color: var(--muted); display: flex; flex-direction: column; gap: 2px; }
+.gate-row input { width: 100%; min-width: 0; font-size: 12px; padding: 4px 6px; }
+.gate-idx { font-size: 11px; color: var(--muted); text-align: center; padding-bottom: 8px; }
+.gate-idx b { color: #ff9d5c; font-size: 14px; }
+.gate-del { height: 28px; align-self: end; }
+.gate-table td { vertical-align: top; font-size: 11px; }
+.gate-table td small { color: var(--muted); font-size: 10px; }
+.gate-table td.good { color: var(--normal); }
+.gate-table td.bad { color: var(--error); }
+.gate-table td.muted-cell { color: var(--muted); }
+.gate-table tr.target td { background: rgba(239,91,107,0.08); }
+.gate-table span.up2 { color: var(--error); }
+.gate-conflict {
+  display: flex; flex-wrap: wrap; gap: 14px; align-items: baseline;
+  margin: 8px 0; padding: 8px 10px; border: 1px solid var(--error);
+  border-radius: 7px; background: rgba(239,91,107,0.07); font-size: 12px;
+}
+.gate-clr { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 8px 0; }
+.gate-profile { margin: 8px 0 4px; }
+.gate-items summary, .gate-pos summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.gate-pos { margin-top: 6px; }
+
 @media (max-width: 1200px) {
   .layout { grid-template-columns: 330px 1fr; }
   .views { grid-template-columns: 1fr; }
@@ -411,4 +451,5 @@ ul.sug-issues li.is-removed .itype { color: var(--normal); }
   .suggest-form { grid-template-columns: 1fr 1fr; }
   .sug-metrics, .ov-metrics { grid-template-columns: 1fr 1fr; }
   .sug-issue-cols { grid-template-columns: 1fr; }
+  .gate-row { grid-template-columns: 40px repeat(2, 1fr) auto; }
 }

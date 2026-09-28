@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.calc import (  # noqa: E402
     calculate,
+    gate_pass,
     load_shed,
     loading_sequence,
     normalize,
@@ -1219,6 +1220,220 @@ class CalcTests(unittest.TestCase):
         oc0 = overturn_check(cleared, 0.15, -0.1)
         self.assertEqual(r["steps"][0]["margin"], oc0["margin"])
         self.assertEqual(r["steps"][0]["totalWeight"], oc0["totalWeight"])
+
+
+    # ------------------------------------------------------------------
+    # 连续窑门通行试算
+    # ------------------------------------------------------------------
+    def _gate_rack(self):
+        """台面/棚板横向（X）外廓均为 [0,1000]，两层各高 300 → 最高点 600。"""
+        return {
+            "car": {"w": 1000, "d": 600},
+            "layers": [
+                {
+                    "name": "L1", "height": 300,
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 600, "weight": 100},
+                    "wareWeight": 0,
+                    "posts": [
+                        {"id": "A", "x": 100, "y": 100, "capacity": 0},
+                        {"id": "B", "x": 900, "y": 500, "capacity": 0},
+                    ],
+                },
+                {
+                    "name": "L2", "height": 300,
+                    "board": {"x": 50, "y": 50, "w": 900, "d": 500, "weight": 80},
+                    "wareWeight": 0,
+                    "posts": [
+                        {"id": "C", "x": 200, "y": 200, "capacity": 0},
+                        {"id": "D", "x": 800, "y": 400, "capacity": 0},
+                    ],
+                },
+            ],
+        }
+
+    def test_gate_profile_and_height(self):
+        r = gate_pass(
+            self._gate_rack(),
+            [{"center": 500, "width": 1100, "height": 700, "maxShift": 0}],
+        )
+        # 台面 [0,1000] 与棚板 [50,950] 并包络 = [0,1000]；最高点 = 300+300
+        self.assertTrue(r["passable"])
+        self.assertEqual(r["profile"]["lo"], 0.0)
+        self.assertEqual(r["profile"]["hi"], 1000.0)
+        self.assertEqual(r["profile"]["width"], 1000.0)
+        self.assertEqual(r["profile"]["topHeight"], 600.0)
+        self.assertEqual(r["lateralAxis"], "x")
+        # 静止(shift=0)通过：左 50、右 50、顶 100
+        self.assertEqual(r["doors"][0]["clearance"], {"left": 50.0, "right": 50.0, "top": 100.0})
+        self.assertEqual(r["positions"][0]["shift"], 0.0)
+        self.assertEqual(r["positions"][0]["move"], 0.0)
+
+    def test_gate_straight_sequence_shifts_and_clearances(self):
+        # 三门依次右移 100，段允许 120 → 全程可行；回溯取最靠近下一门的最小移动：
+        # 末门钳向 0 得 50（own [50,150]），门2、门1随之 50、首门 0
+        gates = [
+            {"center": 500, "width": 1100, "height": 700, "maxShift": 0},
+            {"center": 600, "width": 1100, "height": 700, "maxShift": 120},
+            {"center": 600, "width": 1100, "height": 700, "maxShift": 50},
+        ]
+        r = gate_pass(self._gate_rack(), gates)
+        self.assertTrue(r["passable"], r.get("blockReason"))
+        shifts = [p["shift"] for p in r["positions"]]
+        self.assertEqual(shifts, [0.0, 50.0, 50.0])
+        # 各段移动不超过本段上限
+        for p in r["positions"]:
+            self.assertLessEqual(abs(p["move"]), p["maxShift"] + 1e-9)
+        # 每个所选位置都在该门可达区间内，且净空非负
+        for d in r["doors"]:
+            self.assertGreaterEqual(d["shift"], d["reachRange"]["lo"] - 1e-9)
+            self.assertLessEqual(d["shift"], d["reachRange"]["hi"] + 1e-9)
+            self.assertGreaterEqual(d["clearance"]["left"], -1e-9)
+            self.assertGreaterEqual(d["clearance"]["right"], -1e-9)
+            self.assertGreaterEqual(d["clearance"]["top"], -1e-9)
+        # 门2/门3右移 50：开口 [50,1150]，车体 [50,1050] → 左 0、右 100、顶 100
+        self.assertEqual(r["doors"][1]["clearance"], {"left": 0.0, "right": 100.0, "top": 100.0})
+        self.assertEqual(r["minClearance"], {"left": 0.0, "right": 50.0, "top": 100.0})
+
+    def test_gate_first_door_can_shift_from_departure_point(self):
+        # 首门中心偏右 100：发车段 maxShift=100 时可在首门横移通过（回溯取最小 50）；
+        # maxShift=0 时发车点 0 不在本门区间内 → 阻断
+        g_ok = [{"center": 600, "width": 1100, "height": 700, "maxShift": 100}]
+        r_ok = gate_pass(self._gate_rack(), g_ok)
+        self.assertTrue(r_ok["passable"])
+        self.assertEqual(r_ok["positions"][0]["shift"], 50.0)
+        self.assertEqual(r_ok["positions"][0]["move"], 50.0)
+        self.assertLessEqual(50.0, 100.0)
+        g_no = [{"center": 600, "width": 1100, "height": 700, "maxShift": 0}]
+        r_no = gate_pass(self._gate_rack(), g_no)
+        self.assertFalse(r_no["passable"])
+        self.assertEqual(r_no["blockedAt"], 0)
+        self.assertEqual(r_no["blockKind"], "reach")
+        # 单门本身可以过（中心偏 100、开口余量 100），但被发车段限制卡住
+        self.assertTrue(r_no["doors"][0]["ownPassable"])
+        self.assertEqual(r_no["conflict"]["expandedRange"], {"lo": 0.0, "hi": 0.0})
+
+    def test_gate_each_alone_passable_but_chain_blocked(self):
+        # 两门各自都可通过，但门间需要移动 200、本段只允许 100 → 阻断
+        gates = [
+            {"center": 500, "width": 1100, "height": 700, "maxShift": 0},
+            {"center": 700, "width": 1100, "height": 700, "maxShift": 100},
+        ]
+        r = gate_pass(self._gate_rack(), gates)
+        self.assertFalse(r["passable"])
+        self.assertEqual(r["blockedAt"], 1)
+        self.assertEqual(r["blockKind"], "reach")
+        self.assertTrue(all(d["ownPassable"] for d in r["doors"]))
+        # 门1扩张区间 [-100,100]，门2本门区间 [150,250]
+        self.assertEqual(r["conflict"]["expandedRange"], {"lo": -100.0, "hi": 100.0})
+        self.assertEqual(r["conflict"]["ownRange"], {"lo": 150.0, "hi": 250.0})
+        self.assertFalse(r["doors"][1]["reached"])
+        # 阻断门之后的门不再到达
+        gates.append({"center": 500, "width": 1100, "height": 700, "maxShift": 200})
+        r2 = gate_pass(self._gate_rack(), gates)
+        self.assertFalse(r2["passable"])
+        self.assertEqual(r2["blockedAt"], 1)
+        self.assertFalse(r2["doors"][2]["reached"])
+        self.assertIsNone(r2["positions"])
+
+    def test_gate_height_shortage_blocks_directly(self):
+        gates = [
+            {"center": 500, "width": 5000, "height": 700, "maxShift": 0},
+            {"center": 500, "width": 5000, "height": 599, "maxShift": 100},
+        ]
+        r = gate_pass(self._gate_rack(), gates)
+        self.assertFalse(r["passable"])
+        self.assertEqual(r["blockedAt"], 1)
+        self.assertEqual(r["blockKind"], "height")
+        self.assertFalse(r["doors"][1]["heightPassable"])
+        self.assertIn("高度不足", r["blockReason"])
+
+    def test_gate_own_width_too_narrow(self):
+        r = gate_pass(
+            self._gate_rack(),
+            [{"center": 500, "width": 900, "height": 9999, "maxShift": 9999}],
+        )
+        self.assertFalse(r["passable"])
+        self.assertEqual(r["blockedAt"], 0)
+        self.assertEqual(r["blockKind"], "own-width")
+        self.assertFalse(r["doors"][0]["ownPassable"])
+        self.assertIn("小于架体横向外廓", r["blockReason"])
+
+    def test_gate_exact_fit_is_passable_closed_interval(self):
+        # 开口与外廓等宽等中心、高度恰等于最高点：闭区间贴合（净空 0）仍可通过
+        r = gate_pass(
+            self._gate_rack(),
+            [{"center": 500, "width": 1000, "height": 600, "maxShift": 0}],
+        )
+        self.assertTrue(r["passable"])
+        self.assertEqual(r["minClearance"], {"left": 0.0, "right": 0.0, "top": 0.0})
+
+    def test_gate_profile_includes_oversize_boards(self):
+        # 棚板向左伸出台面：外廓可取负坐标，外廓宽度大于台面
+        rack = {
+            "car": {"w": 1000, "d": 500},
+            "layers": [
+                {
+                    "name": "L1", "height": 300,
+                    "board": {"x": -100, "y": 0, "w": 1200, "d": 500, "weight": 0},
+                    "wareWeight": 0, "posts": [],
+                }
+            ],
+        }
+        r = gate_pass(rack, [{"center": 500, "width": 2000, "height": 400, "maxShift": 0}])
+        self.assertTrue(r["passable"])
+        self.assertEqual((r["profile"]["lo"], r["profile"]["hi"]), (-100.0, 1100.0))
+        self.assertEqual(r["profile"]["width"], 1200.0)
+
+    def test_gate_empty_rack_profile_is_car_only(self):
+        r = gate_pass(
+            {"car": {"w": 800, "d": 400}, "layers": []},
+            [{"center": 400, "width": 900, "height": 10, "maxShift": 0}],
+        )
+        self.assertTrue(r["passable"])
+        self.assertEqual(r["profile"]["width"], 800.0)
+        self.assertEqual(r["profile"]["topHeight"], 0.0)
+        self.assertEqual(r["minClearance"]["top"], 10.0)
+
+    def test_gate_travel_axis_x_uses_y_span(self):
+        r = gate_pass(
+            self._gate_rack(),
+            [{"center": 300, "width": 700, "height": 700, "maxShift": 0}],
+            travel_axis="x",
+        )
+        self.assertTrue(r["passable"])
+        self.assertEqual(r["travelAxis"], "x")
+        self.assertEqual(r["lateralAxis"], "y")
+        # 台面 Y 长 600、棚板 Y [50,550] → 外廓 [0,600]
+        self.assertEqual((r["profile"]["lo"], r["profile"]["hi"]), (0.0, 600.0))
+
+    def test_gate_invalid_params_raise(self):
+        rack = self._gate_rack()
+        with self.assertRaises(ValueError):
+            gate_pass(rack, [])
+        with self.assertRaises(ValueError):
+            gate_pass(rack, "nope")
+        with self.assertRaises(ValueError):
+            gate_pass(rack, [{"center": 0, "width": 0, "height": 1, "maxShift": 1}])
+        with self.assertRaises(ValueError):
+            gate_pass(rack, [{"center": 0, "width": 1, "height": -1, "maxShift": 1}])
+        with self.assertRaises(ValueError):
+            gate_pass(rack, [{"center": 0, "width": 1, "height": 1, "maxShift": -2}])
+        with self.assertRaises(ValueError):
+            gate_pass(rack, [{"width": 1, "height": 1, "maxShift": 1}])  # 缺 center
+        with self.assertRaises(ValueError):
+            gate_pass(rack, [{"center": 0, "width": 1, "height": 1, "maxShift": 1}], travel_axis="z")
+
+    def test_gate_does_not_mutate_input(self):
+        rack = self._gate_rack()
+        gates = [
+            {"center": 500, "width": 1100, "height": 700, "maxShift": 0},
+            {"center": 600, "width": 1100, "height": 700, "maxShift": 120},
+        ]
+        before = json.dumps({"rack": rack, "gates": gates}, ensure_ascii=False, sort_keys=True)
+        r = gate_pass(rack, gates)
+        self.assertTrue(r["passable"])
+        after = json.dumps({"rack": rack, "gates": gates}, ensure_ascii=False, sort_keys=True)
+        self.assertEqual(before, after)
 
 
 if __name__ == "__main__":
